@@ -245,8 +245,33 @@ class UnifiedField:
         abstract_state = self.ngc.get_abstract_state(level=-1)
         retrieved, memory_energy = self.memory.retrieve(abstract_state)
         
-        # === 5. LEARN: Hebbian update on NGC + store in Hopfield ===
-        self.ngc.learn()
+        # Compute memory consistency: how similar is this observation to stored patterns?
+        abstract_norm = np.linalg.norm(abstract_state)
+        retrieved_norm = np.linalg.norm(retrieved)
+        if abstract_norm > 1e-8 and retrieved_norm > 1e-8:
+            memory_similarity = float(np.dot(abstract_state, retrieved) / 
+                                     (abstract_norm * retrieved_norm))
+        else:
+            memory_similarity = 0.0
+        
+        # === 5. LEARN: Precision-modulated Hebbian update ===
+        # Learning modulation: high when observation is consistent with memory,
+        # low when it contradicts stored patterns.
+        # This prevents the NGC from learning equally from truth and lies.
+        #
+        # modulation = sigmoid(memory_similarity * temperature)
+        # When mem_sim is high (consistent): modulation → 1.0 (learn fully)
+        # When mem_sim is low/negative (contradictory): modulation → 0.0 (don't learn)
+        # When no memory yet (step 1-2): modulation = 1.0 (learn from everything initially)
+        if self.memory.n_patterns <= 2:
+            # Not enough memory to judge consistency — learn from everything
+            learning_modulation = 1.0
+        else:
+            # Sigmoid: maps [-1, 1] similarity to [0, 1] modulation
+            # temperature=3.0 makes the transition fairly sharp
+            learning_modulation = float(1.0 / (1.0 + np.exp(-3.0 * memory_similarity)))
+        
+        self.ngc.learn(modulation=learning_modulation)
         self.memory.store(abstract_state)
         
         # === 6. ENERGY: compute decomposition ===
@@ -266,8 +291,8 @@ class UnifiedField:
             "observation": obs_vec,
             "abstract_state": abstract_state,
             "retrieved_memory": retrieved,
-            "memory_similarity": float(np.dot(abstract_state, retrieved) / 
-                                      (np.linalg.norm(abstract_state) * np.linalg.norm(retrieved) + 1e-16)),
+            "memory_similarity": memory_similarity,
+            "learning_modulation": learning_modulation,
             "energy": decomp,
             "settle": settle_result,
             "prediction_error": prediction_error_pre,

@@ -278,31 +278,36 @@ class PredictiveCodingCircuit:
             "layer_states": [l.z.copy() for l in self.layers],
         }
     
-    def learn(self):
+    def learn(self, modulation: float = 1.0):
         """
         Hebbian synaptic update after settling.
         
-        ΔWℓ = lr * (e^{ℓ-1} · (φ(z^ℓ))ᵀ)    — error × pre-synaptic activity
-        ΔEℓ = lr * (z^ℓ · (e^{ℓ-1})ᵀ)         — state × error (feedback path)
+        ΔWℓ = modulation * lr * (e^{ℓ-1} · (φ(z^ℓ))ᵀ)
         
-        Includes weight decay (γ_w) and spectral normalization to prevent
-        weight explosion. This is fully local: each synapse only needs the 
-        pre- and post-synaptic signals available at its endpoints.
+        The modulation parameter gates learning: when the current observation
+        is inconsistent with established beliefs (high prediction error +
+        low memory similarity), modulation should be low, preventing the
+        system from learning from contradictory evidence.
+        
+        This is precision-weighted Hebbian learning: the effective learning
+        rate is lr * modulation, where modulation encodes the system's
+        confidence that this observation is trustworthy.
         """
+        effective_lr = self.lr * modulation
+        
         for ell in range(self.n_layers - 1):
             error_below = self.layers[ell].error
             z_above = self._phi(self.layers[ell + 1].z)
             
             # Generative weight update: Hebbian + decay
             dW = np.outer(error_below, z_above)
-            self.W[ell] += self.lr * dW - self.lr * self.gamma * self.W[ell]
+            self.W[ell] += effective_lr * dW - effective_lr * self.gamma * self.W[ell]
             
             # Feedback weight update
             dE = np.outer(self.layers[ell + 1].z, error_below)
-            self.E[ell] += self.lr * dE - self.lr * self.gamma * self.E[ell]
+            self.E[ell] += effective_lr * dE - effective_lr * self.gamma * self.E[ell]
             
             # Spectral normalization: cap the largest singular value at 1.0
-            # This prevents weight explosion while preserving learned structure
             w_norm = np.linalg.norm(self.W[ell], ord=2)
             if w_norm > 1.0:
                 self.W[ell] /= w_norm
