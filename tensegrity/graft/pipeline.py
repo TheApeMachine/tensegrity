@@ -30,6 +30,7 @@ from tensegrity.graft.logit_bias import (
     StaticLogitBiasBuilder,
     GraftState,
 )
+from tensegrity.torch_device import inference_load_settings
 
 logger = logging.getLogger(__name__)
 
@@ -96,15 +97,17 @@ class HybridPipeline:
             return
         
         from transformers import AutoTokenizer, AutoModelForCausalLM
-        import torch
-        
+
+        dtype, device_map, move_to = inference_load_settings()
         logger.info(f"Loading {self.model_name}...")
         self._tokenizer = AutoTokenizer.from_pretrained(self.model_name)
         self._model = AutoModelForCausalLM.from_pretrained(
             self.model_name,
-            torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-            device_map="auto" if torch.cuda.is_available() else None,
+            torch_dtype=dtype,
+            device_map=device_map,
         )
+        if move_to is not None:
+            self._model = self._model.to(move_to)
         
         # Build vocabulary grounding
         if self._hypothesis_keywords:
