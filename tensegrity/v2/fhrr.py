@@ -58,11 +58,16 @@ class FHRRCodebook:
         self._labels: Dict[str, int] = {}
     
     def register(self, label: str) -> int:
-        """Register a named symbol, return its index."""
+        """Register a named symbol, return its index. Auto-expands if full."""
         if label not in self._labels:
             idx = len(self._labels)
             if idx >= self.n_symbols:
-                raise ValueError(f"Codebook full ({self.n_symbols} symbols)")
+                # Auto-expand: generate more random vectors
+                rng = np.random.RandomState(hash(label) % 2**31)
+                new_phases = rng.uniform(0, 2 * np.pi, size=(256, self.dim))
+                new_vecs = np.exp(1j * new_phases).astype(np.complex64)
+                self.vectors = np.concatenate([self.vectors, new_vecs], axis=0)
+                self.n_symbols += 256
             self._labels[label] = idx
         return self._labels[label]
     
@@ -140,7 +145,7 @@ class FHRREncoder:
     def __init__(self, dim: int = 2048,
                  n_position_moduli: int = 3,
                  position_range: int = 100000,
-                 n_features: int = 256,
+                 n_features: int = 4096,
                  n_roles: int = 32):
         """
         Args:
