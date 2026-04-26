@@ -3,14 +3,17 @@
 Tensegrity Benchmark CLI.
 
 Usage:
-    # Quick dev run (offline, 20 samples/task, 3 tasks):
-    python -m tensegrity.bench.run --mode offline --max-samples 20 --tasks copa,boolq,logiqa
+    # Quick benchmark (offline, 50 samples/task):
+    python -m tensegrity.bench.run --mode offline --max-samples 50 --tasks copa,boolq,sciq
 
-    # Full offline benchmark (all tasks, all samples):
+    # Full offline benchmark:
     python -m tensegrity.bench.run --mode offline
 
+    # λ sweep (find optimal graft weight):
+    python -m tensegrity.bench.run --sweep --max-samples 100 --tasks copa,sciq,truthfulqa
+
     # Local model benchmark (requires GPU):
-    python -m tensegrity.bench.run --mode local --model meta-llama/Llama-3.2-1B-Instruct --max-samples 50
+    python -m tensegrity.bench.run --mode local --model meta-llama/Llama-3.2-1B-Instruct
 
     # Save results:
     python -m tensegrity.bench.run --mode offline --output results.json
@@ -35,10 +38,12 @@ def main():
                         help="Comma-separated task names (default: all)")
     parser.add_argument("--max-samples", type=int, default=None,
                         help="Max samples per task (default: all)")
-    parser.add_argument("--scale", type=float, default=2.5,
-                        help="Graft logit bias scale")
-    parser.add_argument("--entropy-gate", type=float, default=0.85,
-                        help="Convergence gate threshold")
+    parser.add_argument("--lam", type=float, default=1.0,
+                        help="λ — graft weight: score = baseline + λ*tensegrity (default: 1.0)")
+    parser.add_argument("--sweep", action="store_true",
+                        help="Run λ sweep over [0, 0.1, 0.25, 0.5, 1.0, 2.0]")
+    parser.add_argument("--sweep-lambdas", default=None,
+                        help="Custom λ values for sweep (comma-separated, e.g. 0,0.5,1,2,4)")
     parser.add_argument("--output", default=None,
                         help="Save results to JSON file")
     parser.add_argument("--list-tasks", action="store_true",
@@ -62,22 +67,36 @@ def main():
     runner = EvalRunner(
         model_name=args.model,
         mode=args.mode,
-        graft_scale=args.scale,
-        graft_entropy_gate=args.entropy_gate,
+        lam=args.lam,
         seed=args.seed,
     )
 
-    result = runner.run_benchmark(
-        tasks=tasks,
-        max_samples_per_task=args.max_samples,
-        verbose=not args.quiet,
-    )
-
-    if args.output:
-        runner.save_results(result, args.output)
-        print(f"\nResults saved to {args.output}")
+    if args.sweep:
+        lambdas = None
+        if args.sweep_lambdas:
+            lambdas = [float(x) for x in args.sweep_lambdas.split(",")]
+        results = runner.sweep_lambda(
+            tasks=tasks,
+            lambdas=lambdas,
+            max_samples_per_task=args.max_samples,
+            verbose=not args.quiet,
+        )
+        if args.output:
+            sweep_data = [r.to_dict() for r in results]
+            with open(args.output, "w") as f:
+                json.dump(sweep_data, f, indent=2)
+            print(f"\nSweep results saved to {args.output}")
     else:
-        print(f"\n{json.dumps(result.to_dict(), indent=2)}")
+        result = runner.run_benchmark(
+            tasks=tasks,
+            max_samples_per_task=args.max_samples,
+            verbose=not args.quiet,
+        )
+        if args.output:
+            runner.save_results(result, args.output)
+            print(f"\nResults saved to {args.output}")
+        elif not args.quiet:
+            print(f"\n{json.dumps(result.to_dict(), indent=2)}")
 
 
 if __name__ == "__main__":
