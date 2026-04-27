@@ -7,24 +7,18 @@ Two evaluation modes per sample:
             P(choice | prompt) computed from raw logits.
             Prediction = argmax over choices.
 
-  GRAFTED:  score(choice) = llm_logprob(choice) + λ * tensegrity_score(choice)
-            Where λ controls the graft weight. λ=0 recovers baseline.
+  GRAFTED:  score(choice) = llm_logprob(choice) + λ_eff * tensegrity_score(choice)
+            Where λ_eff = λ * (1 - LLM_confidence/threshold) in local mode.
+            The graft is a confidence-gated tiebreaker, not an equal-weight competitor.
 
 The ONLY difference is the additive Tensegrity term.
 This is a controlled A/B comparison.
 
-Metrics per task:
-  - raw_acc:         baseline accuracy
-  - grafted_acc:     grafted accuracy
-  - delta:           grafted - baseline
-  - coverage:        fraction of samples where graft posteriors are non-uniform
-  - cond_acc_biased: accuracy on the subset where graft was non-uniform
-  - mean_bias_mag:   mean max absolute Tensegrity score deviation from uniform
-  - flip_rate:       fraction of samples where baseline_pred != grafted_pred
-  - good_flips:      LLM wrong → graft right
-  - bad_flips:       LLM right → graft wrong
-  - preserved:       LLM right → graft right
-  - neutral:         LLM wrong → graft wrong
+Local mode blending:
+  1. Compute LLM confidence from normalized entropy of softmax(log_probs)
+  2. If LLM confident (norm_entropy < 0.4): don't apply graft (preserve good preds)
+  3. If LLM uncertain: apply graft scaled by uncertainty and proportional to LLM score range
+  4. Graft magnitude capped at 0.3× of the LLM's own score spread
 """
 
 import numpy as np
@@ -88,10 +82,8 @@ class FlipAccounting:
 
     def to_dict(self):
         return {
-            "good_flips": self.good_flips,
-            "bad_flips": self.bad_flips,
-            "preserved": self.preserved,
-            "neutral": self.neutral,
+            "good_flips": self.good_flips, "bad_flips": self.bad_flips,
+            "preserved": self.preserved, "neutral": self.neutral,
             "flip_rate": round(self.flip_rate, 4),
             "good_bad_ratio": round(self.good_bad_ratio, 2) if self.good_bad_ratio != float('inf') else "inf",
         }
@@ -135,9 +127,7 @@ class BenchmarkResult:
 
     def to_dict(self) -> dict:
         return {
-            "model": self.model_name,
-            "mode": self.mode,
-            "lambda": self.lam,
+            "model": self.model_name, "mode": self.mode, "lambda": self.lam,
             "overall": {
                 "baseline_accuracy": round(self.overall_baseline_accuracy, 4),
                 "grafted_accuracy": round(self.overall_grafted_accuracy, 4),
@@ -195,11 +185,13 @@ class EvalRunner:
     Runs baseline vs grafted evaluation on any set of tasks.
 
     Modes:
-      "local"   — Uses transformers model + Tensegrity v2 scoring
+      "local"   — Uses transformers model + confidence-gated Tensegrity v2 scoring
       "offline"  — No LLM; baseline = random, grafted = v2 scoring
 
-    λ parameter:
-      score(choice) = baseline_score(choice) + λ * tensegrity_score(choice)
+    Local mode blending:
+      effective_λ = λ * (1 - LLM_confidence / confidence_gate_threshold)
+      graft_score is scaled to 0.3× of LLM score range
+      If LLM is confident (entropy < 0.4×max): effective_λ = 0 (don't interfere)
     """
 
     def __init__(self, model_name: str = "meta-llama/Llama-3.2-1B-Instruct",
@@ -254,14 +246,8 @@ class EvalRunner:
         return scores
 
     def _get_tensegrity_scores(self, sample: TaskSample) -> Tuple[List[float], float]:
-        """
-        Run Tensegrity v2 cognitive layer on a sample.
-        
-        Uses v2 scoring bridge: FHRR encoding → NGC settling → 
-        multi-signal scoring (similarity + energy + distinctiveness).
-        """
+        """Run Tensegrity v2 scoring bridge on a sample."""
         from tensegrity.v2.graft import V2ScoringBridge
-        
         if not hasattr(self, '_v2_bridge'):
             self._v2_bridge = V2ScoringBridge(
                 obs_dim=256, hidden_dims=[128, 32], fhrr_dim=2048,
@@ -270,12 +256,11 @@ class EvalRunner:
                 context_settle_steps=40, choice_settle_steps=25,
                 context_learning_epochs=3,
             )
-        
         self._v2_bridge.reset()
         return self._v2_bridge.score_choices(sample.prompt, sample.choices)
 
     def evaluate_sample(self, sample: TaskSample) -> SampleResult:
-        """Evaluate a single sample with full diagnostics."""
+        """Evaluate a single sample with confidence-gated blending."""
         t0 = time.time()
         n = len(sample.choices)
 
@@ -293,17 +278,58 @@ class EvalRunner:
             rng = np.random.RandomState(hash(sample.id) % 2**31)
             baseline_scores = rng.randn(n).tolist()
 
-        # Normalize v2 scores for scale matching
-        if bias_applied and score_spread > 0:
-            t_std = float(scores_arr.std())
-            if t_std > 1e-8:
-                normalized_t = [(s - float(scores_arr.mean())) / t_std for s in tensegrity_scores]
+        # === CONFIDENCE-GATED BLENDING ===
+        base_arr = np.array(baseline_scores)
+
+        if self.mode == "local":
+            # LLM confidence from softmax entropy
+            shifted_base = base_arr - base_arr.max()
+            base_probs = np.exp(shifted_base)
+            base_probs_sum = base_probs.sum()
+            base_probs = base_probs / base_probs_sum if base_probs_sum > 0 else np.ones(n) / n
+
+            if n > 1:
+                base_entropy = float(-np.sum(base_probs * np.log(base_probs + 1e-16)))
+                max_entropy = float(np.log(n))
+                llm_norm_entropy = base_entropy / max_entropy if max_entropy > 0 else 0.0
+            else:
+                llm_norm_entropy = 0.0
+
+            llm_confidence = 1.0 - llm_norm_entropy
+
+            # Gate: if LLM is confident, don't interfere
+            confidence_gate_threshold = 0.6
+            if llm_confidence > confidence_gate_threshold:
+                effective_lam = 0.0
+                bias_applied = False
+            else:
+                uncertainty_scale = (1.0 - llm_confidence / confidence_gate_threshold)
+                effective_lam = self.lam * uncertainty_scale
+
+            # Scale graft relative to LLM score range (0.3× = gentle nudge)
+            base_spread = float(base_arr.max() - base_arr.min())
+            if base_spread > 1e-8 and bias_applied:
+                t_std = float(scores_arr.std())
+                if t_std > 1e-8:
+                    normalized_t = [(s - float(scores_arr.mean())) / t_std * base_spread * 0.3
+                                    for s in tensegrity_scores]
+                else:
+                    normalized_t = [0.0] * n
             else:
                 normalized_t = [0.0] * n
         else:
-            normalized_t = [0.0] * n
+            # Offline: simple z-normalization
+            effective_lam = self.lam
+            if bias_applied and score_spread > 0:
+                t_std = float(scores_arr.std())
+                if t_std > 1e-8:
+                    normalized_t = [(s - float(scores_arr.mean())) / t_std for s in tensegrity_scores]
+                else:
+                    normalized_t = [0.0] * n
+            else:
+                normalized_t = [0.0] * n
 
-        grafted_scores = [b + self.lam * t for b, t in zip(baseline_scores, normalized_t)]
+        grafted_scores = [b + effective_lam * t for b, t in zip(baseline_scores, normalized_t)]
 
         baseline_pred = int(np.argmax(baseline_scores))
         grafted_pred = int(np.argmax(grafted_scores))
@@ -339,8 +365,7 @@ class EvalRunner:
 
         results = []
         for i, sample in enumerate(samples):
-            r = self.evaluate_sample(sample)
-            results.append(r)
+            results.append(self.evaluate_sample(sample))
             if verbose and (i + 1) % 100 == 0:
                 acc_b = sum(1 for x in results if x.baseline_correct) / len(results)
                 acc_g = sum(1 for x in results if x.grafted_correct) / len(results)
@@ -385,9 +410,8 @@ class EvalRunner:
             flips=flips, mean_wall_time=np.mean([r.wall_time for r in results]),
         )
 
-    def run_benchmark(self, tasks: Optional[List[str]] = None,
-                      max_samples_per_task: Optional[int] = None,
-                      verbose: bool = True) -> BenchmarkResult:
+    def run_benchmark(self, tasks=None, max_samples_per_task=None,
+                      verbose=True) -> BenchmarkResult:
         if tasks is None:
             tasks = list(TASK_REGISTRY.keys())
         if verbose:
