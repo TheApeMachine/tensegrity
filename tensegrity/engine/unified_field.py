@@ -26,8 +26,9 @@ from the composition of these local optimizations.
 """
 
 import numpy as np
-from typing import Dict, List, Optional, Any, Tuple
+from typing import Dict, List, Optional, Any, Tuple, Deque
 from dataclasses import dataclass
+from collections import deque
 
 from .fhrr import FHRREncoder, bind, bundle, unbind
 from .ngc import PredictiveCodingCircuit
@@ -40,7 +41,7 @@ class EnergyDecomposition:
     memory: float        # Hopfield retrieval energy
     causal: float        # Causal SCM prediction error
     total: float         # Sum
-    prediction_error_norm: float  # ||observation - predicted||
+    prediction_error_norm: float  # ||obs − predicted||² after settling (sensor space)
     surprise: float      # -log P(observation | beliefs)
 
 
@@ -63,7 +64,7 @@ class HopfieldMemoryBank:
         self.beta = beta
         self.capacity = capacity
         
-        self.patterns: List[np.ndarray] = []
+        self.patterns: deque = deque(maxlen=capacity)
         self._matrix: Optional[np.ndarray] = None
         self._dirty = True
     
@@ -76,10 +77,6 @@ class HopfieldMemoryBank:
                 p = p / norm
         self.patterns.append(p)
         self._dirty = True
-        
-        if len(self.patterns) > self.capacity:
-            self.patterns.pop(0)
-            self._dirty = True
     
     def retrieve(self, query: np.ndarray, steps: int = 3) -> Tuple[np.ndarray, float]:
         """
@@ -120,7 +117,7 @@ class HopfieldMemoryBank:
     
     def _ensure_matrix(self):
         if self._dirty and self.patterns:
-            self._matrix = np.column_stack(self.patterns)
+            self._matrix = np.column_stack(list(self.patterns))
             self._dirty = False
     
     @property
@@ -155,7 +152,8 @@ class UnifiedField:
                  hopfield_beta: float = 0.01,
                  ngc_settle_steps: int = 20,
                  ngc_learning_rate: float = 0.005,
-                 ngc_precisions: Optional[List[float]] = None):
+                 ngc_precisions: Optional[List[float]] = None,
+                 energy_history_maxlen: int = 500):
         """
         Args:
             obs_dim: Dimension of the observation layer (FHRR → real projection)
@@ -165,6 +163,7 @@ class UnifiedField:
             hopfield_beta: Inverse temperature for Hopfield retrieval
             ngc_settle_steps: Settling iterations for NGC
             ngc_learning_rate: Hebbian learning rate
+            energy_history_maxlen: Max UnifiedField energy decomposition records retained
         """
         if hidden_dims is None:
             hidden_dims = [128, 32]
@@ -195,7 +194,7 @@ class UnifiedField:
         
         # Energy tracking
         self._step_count = 0
-        self.energy_history: List[EnergyDecomposition] = []
+        self.energy_history: Deque[EnergyDecomposition] = deque(maxlen=max(1, int(energy_history_maxlen)))
     
     def _fhrr_to_obs(self, fhrr_vec: np.ndarray) -> np.ndarray:
         """Project FHRR complex vector to real observation space."""
@@ -234,12 +233,14 @@ class UnifiedField:
         
         obs_vec = self._fhrr_to_obs(fhrr_vec)
         
-        # === 2. PREDICT: what did the NGC expect to see? ===
-        prediction_error_pre = self.ngc.prediction_error(obs_vec)
+        # === 2. PREDICT: what did the NGC expect before this observation's settle cycle? ===
+        prediction_error_pre_settle = self.ngc.prediction_error(obs_vec)
         
         # === 3. SETTLE: minimize perception energy ===
         settle_result = self.ngc.settle(obs_vec)
         perception_energy = settle_result["final_energy"]
+        
+        prediction_error_post_settle = self.ngc.prediction_error(obs_vec)
         
         # === 4. REMEMBER: query Hopfield with abstract state ===
         abstract_state = self.ngc.get_abstract_state(level=-1)
@@ -280,8 +281,8 @@ class UnifiedField:
             memory=memory_energy,
             causal=0.0,  # Will be added when causal module is connected
             total=perception_energy + memory_energy,
-            prediction_error_norm=float(prediction_error_pre),
-            surprise=float(np.log(max(prediction_error_pre, 1e-16))),
+            prediction_error_norm=float(prediction_error_post_settle),
+            surprise=float(np.log(max(prediction_error_post_settle, 1e-16))),
         )
         self.energy_history.append(decomp)
         
@@ -295,7 +296,9 @@ class UnifiedField:
             "learning_modulation": learning_modulation,
             "energy": decomp,
             "settle": settle_result,
-            "prediction_error": prediction_error_pre,
+            "prediction_error": prediction_error_pre_settle,
+            "prediction_error_pre_settle": prediction_error_pre_settle,
+            "prediction_error_post_settle": prediction_error_post_settle,
         }
     
     def predict(self) -> np.ndarray:

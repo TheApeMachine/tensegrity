@@ -15,7 +15,7 @@ CRITICAL DESIGN RULE:
   - If the LLM can express an opinion in a field, that field shouldn't exist.
 """
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from typing import List, Optional, Literal
 from enum import Enum
 
@@ -43,18 +43,58 @@ class RelationMention(BaseModel):
     negated: bool = False
 
 
+_SCM_IDENTIFIER_MAX = 64
+
+
 class CausalEdge(BaseModel):
     """One edge in a proposed structural causal model (SCM)."""
-    source: str = Field(description="Cause or enabling variable name")
-    target: str = Field(description="Effect variable name")
+    source: str = Field(
+        min_length=1,
+        max_length=_SCM_IDENTIFIER_MAX,
+        description="Cause or enabling variable name",
+    )
+    target: str = Field(
+        min_length=1,
+        max_length=_SCM_IDENTIFIER_MAX,
+        description="Effect variable name",
+    )
     mechanism: Literal["causes", "prevents", "enables"]
 
 
 class ProposedSCM(BaseModel):
     """LLM-proposed SCM as a named DAG plus short description."""
-    name: str = Field(max_length=64, description="Short identifier, suitable for SCM.name")
+    name: str = Field(max_length=_SCM_IDENTIFIER_MAX, description="Short identifier, suitable for SCM.name")
     description: str = Field(max_length=512, description="One sentence: what this model claims")
     edges: List[CausalEdge] = Field(max_length=48, description="Directed edges; must be acyclic")
+
+    @model_validator(mode="after")
+    def _edges_must_be_acyclic(self) -> "ProposedSCM":
+        from collections import defaultdict, deque
+
+        edges = [(e.source.strip(), e.target.strip()) for e in self.edges]
+        adj: defaultdict[str, list[str]] = defaultdict(list)
+        indegree: defaultdict[str, int] = defaultdict(int)
+        nodes: set[str] = set()
+        for s, t in edges:
+            if not s or not t:
+                continue
+            nodes.add(s)
+            nodes.add(t)
+            adj[s].append(t)
+            indegree[t] += 1
+
+        q: deque[str] = deque([n for n in nodes if indegree.get(n, 0) == 0])
+        visited_count = 0
+        while q:
+            u = q.popleft()
+            visited_count += 1
+            for v in adj[u]:
+                indegree[v] -= 1
+                if indegree[v] == 0:
+                    q.append(v)
+        if edges and visited_count != len(nodes):
+            raise ValueError("ProposedSCM.edges must form a DAG; a cycle was detected.")
+        return self
 
 
 class ParsedObservation(BaseModel):
@@ -67,6 +107,7 @@ class ParsedObservation(BaseModel):
     relations: List[RelationMention] = Field(default_factory=list)
     implicit_relations: List[RelationMention] = Field(
         default_factory=list,
+        max_length=48,
         description=(
             "Typed implications required for consistency with the text but not literally stated; "
             "use closed predicates only (same vocabulary as relations)."

@@ -16,6 +16,7 @@ competing causal models (compression = model evidence, tension = model
 disagreement) balanced by the free energy principle.
 """
 
+import hashlib
 import numpy as np
 from typing import Optional, Dict, List, Any, Tuple
 import logging
@@ -31,6 +32,9 @@ from tensegrity.inference.free_energy import FreeEnergyEngine
 from tensegrity.engine.unified_field import UnifiedField
 
 logger = logging.getLogger(__name__)
+
+# Default SCM registered in ``_init_default_models`` whose observation vector includes ``cause``.
+DEFAULT_MEDIATED_SCM_NAME = "mediated_causal"
 
 
 class TensegrityAgent:
@@ -62,7 +66,13 @@ class TensegrityAgent:
                  associative_dim: int = 128,
                  planning_horizon: int = 3,
                  precision: float = 4.0,
-                 zipf_exponent: float = 1.0):
+                 zipf_exponent: float = 1.0,
+                 unified_obs_dim: int = 256,
+                 unified_hidden_dims: Optional[List[int]] = None,
+                 unified_fhrr_dim: int = 2048,
+                 unified_hopfield_beta: float = 0.01,
+                 unified_ngc_settle_steps: int = 20,
+                 unified_ngc_learning_rate: float = 0.005):
         """
         Args:
             n_states: Number of hidden states in the generative model
@@ -75,6 +85,12 @@ class TensegrityAgent:
             planning_horizon: How far ahead to plan
             precision: Inverse temperature for policy selection
             zipf_exponent: Controls power-law memory access
+            unified_obs_dim: Observation layer width for UnifiedField (default matches prior hardcoded wiring)
+            unified_hidden_dims: NGC hidden layer sizes; defaults to ``[128, 32]`` when None
+            unified_fhrr_dim: FHRR encoder dimensionality
+            unified_hopfield_beta: Hopfield inverse temperature in UnifiedField
+            unified_ngc_settle_steps: NGC settling iterations
+            unified_ngc_learning_rate: Hebbian learning rate inside UnifiedField
         """
         self.n_states = n_states
         self.n_obs = n_observations
@@ -138,14 +154,15 @@ class TensegrityAgent:
         # Initialize with default competing models
         self._init_default_models()
         
+        u_hidden = unified_hidden_dims if unified_hidden_dims is not None else [128, 32]
         # Single perceptual substrate: FHRR → NGC → Hopfield (replaces parallel Morton-sense path).
         self.field = UnifiedField(
-            obs_dim=256,
-            hidden_dims=[128, 32],
-            fhrr_dim=2048,
-            hopfield_beta=0.01,
-            ngc_settle_steps=20,
-            ngc_learning_rate=0.005,
+            obs_dim=unified_obs_dim,
+            hidden_dims=u_hidden,
+            fhrr_dim=unified_fhrr_dim,
+            hopfield_beta=unified_hopfield_beta,
+            ngc_settle_steps=unified_ngc_settle_steps,
+            ngc_learning_rate=unified_ngc_learning_rate,
         )
     
     def _init_default_models(self):
@@ -164,7 +181,7 @@ class TensegrityAgent:
                            parents=["state"])
         
         # Model B: Mediated — hidden cause → state → observation
-        model_b = StructuralCausalModel(name="mediated_causal")
+        model_b = StructuralCausalModel(name=DEFAULT_MEDIATED_SCM_NAME)
         model_b.add_variable("cause", n_values=self.n_states)
         model_b.add_variable("state", n_values=self.n_states,
                            parents=["cause"])
@@ -218,9 +235,9 @@ class TensegrityAgent:
         decomp = cycle["energy"]
         surprise = float(decomp.surprise)
 
-        # Deterministic discrete index for generative-model matrices
-        v = np.arange(1, len(obs_vec) + 1, dtype=np.float64)
-        obs_idx = int(np.abs(np.dot(obs_vec, v))) % max(self.n_obs, 1)
+        # Integer-safe deterministic index from observation vector (avoid float dot overflow)
+        h = hashlib.sha256(obs_vec.astype(np.float64, copy=False).tobytes()).digest()
+        obs_idx = int.from_bytes(h[:8], byteorder="big", signed=False) % max(self.n_obs, 1)
 
         A = self.epistemic.A
         B = self.epistemic.B
@@ -244,12 +261,12 @@ class TensegrityAgent:
             "state": int(np.argmax(q_states)),
             "observation": obs_idx,
         }
-        if "mediated_causal" in self.arena.models:
+        if DEFAULT_MEDIATED_SCM_NAME in self.arena.models:
             causal_obs["cause"] = int(np.argmax(q_states))
 
         arena_result = self.arena.compete(causal_obs)
 
-        morton_codes = np.array([obs_idx], dtype=np.int64)
+        obs_codes = np.array([obs_idx], dtype=np.int64)
         self.blanket.surprise = surprise
 
         self._total_surprise += surprise
@@ -257,7 +274,7 @@ class TensegrityAgent:
 
         return {
             "step": self._step_count,
-            "morton_codes": morton_codes,
+            "obs_codes": obs_codes,
             "observation_index": obs_idx,
             "belief_state": q_states,
             "free_energy": F,

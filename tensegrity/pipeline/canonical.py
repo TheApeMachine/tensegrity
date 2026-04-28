@@ -51,6 +51,7 @@ class CanonicalPipeline:
         choice_settle_steps: int = 25,
         context_learning_epochs: int = 3,
     ):
+        # model_name: kept for API stability and future wiring to remote models / logging
         self.model_name = model_name
         self.belief_blend = belief_blend
         self.controller = CognitiveController(
@@ -122,6 +123,11 @@ class CanonicalPipeline:
 
     def _fuse_field_and_hypotheses(self, field: np.ndarray, agent_probs: np.ndarray) -> np.ndarray:
         if field.shape != agent_probs.shape:
+            logger.warning(
+                "_fuse_field_and_hypotheses: shape mismatch field=%s agent_probs=%s; returning field unchanged",
+                field.shape,
+                agent_probs.shape,
+            )
             return field
         zf = (field - field.mean()) / (field.std() + 1e-8)
         a = np.log(agent_probs + 1e-12)

@@ -44,15 +44,17 @@ class HybridPipeline:
     delegated to the LLM.
     """
     
-    def __init__(self,
-                 hypothesis_labels: List[str],
-                 hypothesis_keywords: Optional[Dict[str, List[str]]] = None,
-                 model_name: str = "meta-llama/Llama-3.2-1B-Instruct",
-                 mode: str = "local",
-                 scale: float = 2.5,
+    def __init__(
+        self,
+        hypothesis_labels: List[str],
+        hypothesis_keywords: Optional[Dict[str, List[str]]] = None,
+        model_name: str = "meta-llama/Llama-3.2-1B-Instruct",
+        mode: str = "local",
+        scale: float = 2.5,
         entropy_gate: float = 0.85,
         suppress_threshold: float = 0.01,
-        async_graft: bool = True):
+        async_graft: bool = True,
+    ):
         """
         Args:
             hypothesis_labels: List of hypothesis names

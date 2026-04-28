@@ -17,7 +17,7 @@ data that doesn't match the schema.
 import os
 import json
 import logging
-from typing import Optional, Type, TypeVar, Union, List
+from typing import Optional, Tuple, Type, TypeVar, Union, List
 
 from pydantic import BaseModel
 
@@ -34,6 +34,33 @@ from tensegrity.broca.schemas import (
 logger = logging.getLogger(__name__)
 
 T = TypeVar('T', bound=BaseModel)
+
+_CAUSAL_SUMMARY_MAX_CHARS = 2400
+
+
+class DuplicateModelNameError(ValueError):
+    """Raised when ProposedSCM.name collides with ``existing_model_names`` from the causal arena."""
+
+def truncate_to_sentence(text: str, max_len: int = _CAUSAL_SUMMARY_MAX_CHARS) -> Tuple[str, bool]:
+    """
+    Trim ``text`` to at most ``max_len`` characters, preferring truncation after the last
+    complete sentence (. ? ! optionally followed by space) within that window.
+    """
+    if len(text) <= max_len:
+        return text, False
+    chunk = text[:max_len]
+    last_break_end = -1
+    i = 0
+    while i < len(chunk):
+        if chunk[i] in ".?!" and (i + 1 == len(chunk) or chunk[i + 1].isspace()):
+            last_break_end = i + 1
+        i += 1
+    if last_break_end > 0:
+        return chunk[:last_break_end].rstrip(), True
+    cut = chunk.rfind(" ")
+    if cut > max_len // 2:
+        return chunk[:cut].rstrip(), True
+    return chunk, True
 
 
 class BrocaInterface:
@@ -80,6 +107,7 @@ class BrocaInterface:
         
         # Call counter for diagnostics
         self._parse_calls = 0
+        self._hypothesis_calls = 0
         self._produce_calls = 0
         self._total_tokens = 0
     
@@ -169,16 +197,31 @@ class BrocaInterface:
             "Name must differ from existing model names. Output only the schema fields."
         )
         existing = ", ".join(existing_model_names[:24]) if existing_model_names else "(none)"
+        summary, did_truncate = truncate_to_sentence(situation_summary, _CAUSAL_SUMMARY_MAX_CHARS)
+        if did_truncate:
+            logger.warning(
+                "situation_summary truncated for causal hypothesis prompt: "
+                "original_length=%d max_chars=%d",
+                len(situation_summary),
+                _CAUSAL_SUMMARY_MAX_CHARS,
+            )
         user_content = (
             f"Existing models: {existing}\n\n"
-            f"Observations / situation:\n{situation_summary[:2400]}"
+            f"Observations / situation:\n{summary}"
         )
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_content},
         ]
-        self._parse_calls += 1
-        return self._call_llm(messages, ProposedSCM, self.max_parse_tokens)
+        self._hypothesis_calls += 1
+        proposed = self._call_llm(messages, ProposedSCM, self.max_parse_tokens)
+        existing_lower = {n.casefold(): n for n in existing_model_names}
+        if proposed.name.casefold() in existing_lower:
+            raise DuplicateModelNameError(
+                f"LLM proposed duplicate SCM name {proposed.name!r}; existing names included "
+                f"{existing_lower[proposed.name.casefold()]!r}. Update prompts or regenerate."
+            )
+        return proposed
     
     def parse_feedback(self, feedback: str, 
                        action_taken: str,
@@ -287,6 +330,7 @@ class BrocaInterface:
     def statistics(self):
         return {
             "parse_calls": self._parse_calls,
+            "hypothesis_calls": self._hypothesis_calls,
             "produce_calls": self._produce_calls,
             "total_tokens": self._total_tokens,
             "model": self.model,

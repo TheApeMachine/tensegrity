@@ -21,9 +21,10 @@ from typing import Optional, Dict, List, Any, Tuple
 from dataclasses import dataclass, field
 import logging
 import json
+import re
+from difflib import SequenceMatcher
 
-from tensegrity.core.agent import TensegrityAgent
-from tensegrity.causal.scm import StructuralCausalModel
+from tensegrity.core.agent import TensegrityAgent, DEFAULT_MEDIATED_SCM_NAME
 from tensegrity.broca.schemas import (
     ParsedObservation,
     ParsedFeedback,
@@ -39,6 +40,31 @@ from tensegrity.causal.from_proposal import build_scm_from_proposal
 logger = logging.getLogger(__name__)
 
 IMPLICIT_RELATION_WEIGHT = 0.3
+_REL_SEQUENCE_RATIO_THRESHOLD = 0.8
+
+
+def _alnum_tokens(s: str) -> set[str]:
+    return {t.lower() for t in re.findall(r"[A-Za-z0-9]+", s) if t}
+
+
+def _relation_term_matches_hypothesis(term: str, label: str) -> bool:
+    """Stricter than substring overlap: tokens, regex word boundaries, or high string similarity."""
+    term = term.strip().lower()
+    label = label.strip().lower()
+    if not term or not label:
+        return False
+    if term == label:
+        return True
+    if re.search(r"\b" + re.escape(term) + r"\b", label):
+        return True
+    if re.search(r"\b" + re.escape(label) + r"\b", term):
+        return True
+    tt, lt = _alnum_tokens(term), _alnum_tokens(label)
+    if tt and lt and tt & lt:
+        return True
+    if SequenceMatcher(None, term, label).ratio() > _REL_SEQUENCE_RATIO_THRESHOLD:
+        return True
+    return False
 
 
 class CognitiveController:
@@ -65,7 +91,8 @@ class CognitiveController:
                  n_hypotheses: int = 8,
                  hypothesis_labels: Optional[List[str]] = None,
                  use_llm: bool = True,
-                 enable_hypothesis_generation: bool = False):
+                 enable_hypothesis_generation: bool = False,
+                 confirmed_facts_max: int = 5):
         """
         Args:
             agent: TensegrityAgent instance. Created with defaults if None.
@@ -74,20 +101,29 @@ class CognitiveController:
             hypothesis_labels: Labels for the hypothesis space
             use_llm: If False, uses template-based parse/produce (for testing without API)
             enable_hypothesis_generation: If True and use_llm, may add LLM-proposed SCMs when tension is high
+            confirmed_facts_max: Rolling window size for belief_state.confirmed_facts (matches parse-context tail)
         """
         self.use_llm = use_llm
         self.enable_hypothesis_generation = enable_hypothesis_generation
+        self.confirmed_facts_max = max(1, int(confirmed_facts_max))
         
-        # Cognitive substrate
-        n_states = n_hypotheses
-        n_obs = n_hypotheses * 4  # Observation space > hypothesis space
+        labels_for_hyp: Optional[List[str]] = None
+        if hypothesis_labels is not None:
+            labels_for_hyp = list(hypothesis_labels)
+            n_states = max(len(labels_for_hyp), n_hypotheses, 2)
+            while len(labels_for_hyp) < n_states:
+                labels_for_hyp.append(f"_empty_{len(labels_for_hyp)}")
+        else:
+            n_states = max(n_hypotheses, 2)
+        
+        n_obs = n_states * 4  # Observation space > hypothesis space
         n_actions = 4  # ask, state, eliminate, conclude
         
         self.agent = agent or TensegrityAgent(
             n_states=n_states,
             n_observations=n_obs,
             n_actions=n_actions,
-            sensory_dims=n_hypotheses,  # Morton dims = hypothesis dims
+            sensory_dims=n_states,  # Morton dims = hypothesis dims
             sensory_bits=4,
             context_dim=32,
             associative_dim=64,
@@ -114,8 +150,8 @@ class CognitiveController:
         )
         
         # Hypothesis labels
-        if hypothesis_labels:
-            self._init_hypotheses(hypothesis_labels)
+        if hypothesis_labels is not None and labels_for_hyp is not None:
+            self._init_hypotheses(labels_for_hyp)
         
         # Conversation history (for LLM context — but NOT the belief state)
         self._conversation: List[Dict[str, str]] = []
@@ -139,6 +175,8 @@ class CognitiveController:
         if not labels:
             labels = ["_empty_"]
         n_hyp = max(len(labels), 2)
+        while len(labels) < n_hyp:
+            labels.append(f"_empty_{len(labels)}")
         self.agent = TensegrityAgent(
             n_states=n_hyp,
             n_observations=n_hyp * 4,
@@ -162,6 +200,36 @@ class CognitiveController:
         )
         self._init_hypotheses(labels)
         self._conversation.clear()
+
+    def _trim_confirmed_facts(self) -> None:
+        """Keep only the last ``confirmed_facts_max`` entries (rolling window)."""
+        n = self.confirmed_facts_max
+        facts = self.belief_state.confirmed_facts
+        if len(facts) > n:
+            self.belief_state.confirmed_facts = facts[-n:]
+
+    def _record_parsed_facts(self, parsed: ParsedObservation) -> None:
+        """Append structured parse results to confirmed facts with consistent formatting."""
+        turn = self.belief_state.turn
+        for entity in parsed.entities:
+            fact = (
+                f"[T{turn}] Observed: {entity.normalized} ({entity.entity_type})"
+            )
+            self.belief_state.confirmed_facts.append(fact)
+        for relation in parsed.relations:
+            fact = f"[T{turn}] {relation.subject} {relation.predicate} {relation.object}"
+            if relation.negated:
+                fact = f"NOT({fact})"
+            self.belief_state.confirmed_facts.append(fact)
+        for relation in parsed.implicit_relations:
+            fact = (
+                f"[T{turn}] (implicit) {relation.subject} "
+                f"{relation.predicate} {relation.object}"
+            )
+            if relation.negated:
+                fact = f"NOT({fact})"
+            self.belief_state.confirmed_facts.append(fact)
+        self._trim_confirmed_facts()
     
     def perceive_only(self, input_text: str) -> Dict[str, Any]:
         """
@@ -176,28 +244,7 @@ class CognitiveController:
         perception = self.agent.perceive(obs_vector)
         self._maybe_inject_causal_hypothesis(perception, input_text)
         self._update_hypotheses_from_inference(perception, obs_vector)
-        for entity in parsed.entities:
-            fact = (
-                f"[T{self.belief_state.turn}] Observed: {entity.normalized} "
-                f"({entity.entity_type})"
-            )
-            self.belief_state.confirmed_facts.append(fact)
-        for relation in parsed.relations:
-            fact = (
-                f"[T{self.belief_state.turn}] {relation.subject} "
-                f"{relation.predicate} {relation.object}"
-            )
-            if relation.negated:
-                fact = f"NOT({fact})"
-            self.belief_state.confirmed_facts.append(fact)
-        for relation in parsed.implicit_relations:
-            fact = (
-                f"[T{self.belief_state.turn}] (implicit) {relation.subject} "
-                f"{relation.predicate} {relation.object}"
-            )
-            if relation.negated:
-                fact = f"NOT({fact})"
-            self.belief_state.confirmed_facts.append(fact)
+        self._record_parsed_facts(parsed)
         return {
             "perception": {
                 "free_energy": perception["free_energy"],
@@ -235,8 +282,14 @@ class CognitiveController:
         for relation in relations:
             subj = relation.subject.lower()
             obj = relation.object.lower()
-            subj_matches = [i for label, i in hyp_labels.items() if subj in label or label in subj]
-            obj_matches = [i for label, i in hyp_labels.items() if obj in label or label in obj]
+            subj_matches = [
+                i for label, i in hyp_labels.items()
+                if _relation_term_matches_hypothesis(subj, label)
+            ]
+            obj_matches = [
+                i for label, i in hyp_labels.items()
+                if _relation_term_matches_hypothesis(obj, label)
+            ]
             sign = -1.0 if relation.negated else 1.0
             w = weight
             if relation.predicate in ("causes", "enables", "confirms", "is_a", "has_property"):
@@ -275,11 +328,16 @@ class CognitiveController:
                 "state": int(np.argmax(q)),
                 "observation": int(obs_idx),
             }
-            if "mediated_causal" in self.agent.arena.models:
+            if DEFAULT_MEDIATED_SCM_NAME in self.agent.arena.models:
                 causal_obs["cause"] = int(np.argmax(q))
             perception["arena"] = self.agent.arena.compete(causal_obs)
-        except Exception as e:
-            logger.warning("Dynamic causal hypothesis skipped: %s", e)
+        except (KeyError, ValueError, IndexError, TypeError) as e:
+            logger.warning(
+                "Dynamic causal hypothesis skipped [%s]: %s",
+                type(e).__name__,
+                e,
+                exc_info=False,
+            )
     
     def _observation_to_vector(self, parsed: ParsedObservation) -> np.ndarray:
         """
@@ -524,25 +582,8 @@ class CognitiveController:
         self._update_hypotheses_from_inference(perception, obs_vector)
         
         # Update confirmed facts and evidence
-        for entity in parsed.entities:
-            fact = f"[T{self.belief_state.turn}] Observed: {entity.normalized} ({entity.entity_type})"
-            self.belief_state.confirmed_facts.append(fact)
-        
-        for relation in parsed.relations:
-            fact = f"[T{self.belief_state.turn}] {relation.subject} {relation.predicate} {relation.object}"
-            if relation.negated:
-                fact = f"NOT({fact})"
-            self.belief_state.confirmed_facts.append(fact)
-        
-        for relation in parsed.implicit_relations:
-            fact = (
-                f"[T{self.belief_state.turn}] (implicit) {relation.subject} "
-                f"{relation.predicate} {relation.object}"
-            )
-            if relation.negated:
-                fact = f"NOT({fact})"
-            self.belief_state.confirmed_facts.append(fact)
-        
+        self._record_parsed_facts(parsed)
+
         # === 3. SELECT ACTION (Tensegrity decides) ===
         action = self._select_cognitive_action(perception)
         
@@ -604,15 +645,16 @@ class CognitiveController:
         # Add new information
         for info in feedback.new_information:
             self.belief_state.confirmed_facts.append(f"[T{self.belief_state.turn}] {info}")
-        
-        # Now run the perception cycle with the feedback as observation
+        self._trim_confirmed_facts()
         return self.step(feedback_text)
     
     def _get_parse_context(self) -> str:
         """Build context string for parse calls."""
         ctx_parts = []
         if self.belief_state.confirmed_facts:
-            ctx_parts.append(f"Known facts: {'; '.join(self.belief_state.confirmed_facts[-5:])}")
+            slice_n = self.confirmed_facts_max
+            facts_str = '; '.join(self.belief_state.confirmed_facts[-slice_n:])
+            ctx_parts.append(f"Known facts: {facts_str}")
         if self.belief_state.hypotheses:
             active = [h for h in self.belief_state.hypotheses 
                      if h.id not in self.belief_state.eliminated_hypotheses]

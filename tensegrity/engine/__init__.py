@@ -16,3 +16,22 @@ from tensegrity.engine.fhrr import (
 )
 from tensegrity.engine.causal_energy import EnergyCausalArena, CausalEnergyTerm
 from tensegrity.engine.scoring import ScoringBridge, NGCLogitsProcessor
+
+__all__ = (
+    "UnifiedField",
+    "HopfieldMemoryBank",
+    "EnergyDecomposition",
+    "PredictiveCodingCircuit",
+    "LayerState",
+    "FHRREncoder",
+    "FHRRCodebook",
+    "SemanticFHRRCodebook",
+    "bind",
+    "bundle",
+    "unbind",
+    "permute",
+    "EnergyCausalArena",
+    "CausalEnergyTerm",
+    "ScoringBridge",
+    "NGCLogitsProcessor",
+)

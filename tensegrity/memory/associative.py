@@ -122,6 +122,14 @@ class AssociativeMemory:
         
         return idx
     
+    def _maybe_decay_on_retrieve(self) -> None:
+        self._retrieve_calls += 1
+        if (
+            self.decay_every_n_retrieves > 0
+            and self._retrieve_calls % self.decay_every_n_retrieves == 0
+        ):
+            self._decay_access_counts()
+    
     def retrieve(self, query: np.ndarray, return_energy: bool = False,
                 top_k: int = 1) -> Any:
         """
@@ -143,13 +151,9 @@ class AssociativeMemory:
         if not self.patterns:
             return (np.zeros(self.dim), float('inf')) if return_energy else np.zeros(self.dim)
         
-        self._retrieve_calls += 1
-        if self.decay_every_n_retrieves > 0 and self._retrieve_calls % self.decay_every_n_retrieves == 0:
-            self._decay_access_counts()
+        self._maybe_decay_on_retrieve()
         
         self._ensure_matrix()
-        
-        # Normalize query
         query = np.asarray(query, dtype=np.float64).flatten()
         norm = np.linalg.norm(query)
         if norm > 0:
@@ -219,9 +223,7 @@ class AssociativeMemory:
         if not self.patterns:
             return np.zeros(self.dim), np.array([])
         
-        self._retrieve_calls += 1
-        if self.decay_every_n_retrieves > 0 and self._retrieve_calls % self.decay_every_n_retrieves == 0:
-            self._decay_access_counts()
+        self._maybe_decay_on_retrieve()
         
         self._ensure_matrix()
         

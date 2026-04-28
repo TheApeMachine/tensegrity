@@ -3,9 +3,10 @@ Semantic scoring bridge + NGC logit bias injection (part of the unified engine).
 """
 
 import numpy as np
-from typing import Dict, List, Optional, Callable, Set, Tuple
+from typing import Dict, List, Optional, Callable, Set, Tuple, Any
 import math
 import logging
+import re
 import threading
 
 logger = logging.getLogger(__name__)
@@ -55,6 +56,10 @@ class NGCLogitsProcessor:
         self._wake.set()
         if self._worker is not None:
             self._worker.join(timeout=2.0)
+            if self._worker.is_alive():
+                logger.warning(
+                    "NGCLogitsProcessor worker did not stop within 2.0s (belief_fn may block)"
+                )
             self._worker = None
     
     def _build_projections(self):
@@ -96,7 +101,8 @@ class NGCLogitsProcessor:
             self._wake.clear()
             if self._halt.is_set():
                 break
-            ids = self._pending_ids
+            with self._lock:
+                ids = self._pending_ids
             if ids is None:
                 continue
             try:
@@ -109,14 +115,35 @@ class NGCLogitsProcessor:
     
     def __call__(self, input_ids, scores):
         self._step_count += 1
-        ids = input_ids[0].tolist()[-16:]
+        _ensure_torch()
+        if not isinstance(input_ids, torch.Tensor):
+            arr = np.asarray(input_ids)
+            if arr.ndim == 1:
+                flat = arr.tolist()
+            elif arr.ndim == 2:
+                flat = arr[-1].tolist()
+            else:
+                raise ValueError(f"input_ids must be 1D or 2D, got shape {arr.shape}")
+        else:
+            if input_ids.dim() == 1:
+                flat = input_ids.detach().cpu().tolist()
+            elif input_ids.dim() == 2:
+                flat = input_ids[-1].detach().cpu().tolist()
+            else:
+                raise ValueError(f"input_ids must be 1D or 2D, got shape {tuple(input_ids.shape)}")
+        ids = flat[-16:]
         if self.async_cognitive:
-            self._pending_ids = ids
+            with self._lock:
+                self._pending_ids = list(ids)
             self._wake.set()
             with self._lock:
                 bias_np = None if self._latest_bias_np is None else self._latest_bias_np.copy()
             if bias_np is None:
                 return scores
+            _ensure_torch()
+            assert scores.shape[0] == 1, (
+                f"NGCLogitsProcessor expects batch size 1, got {scores.shape[0]}"
+            )
             return scores + torch.tensor(bias_np, device=scores.device, dtype=scores.dtype).unsqueeze(0)
         
         try:
@@ -126,6 +153,9 @@ class NGCLogitsProcessor:
             return scores
         if bias_np is None:
             return scores
+        assert scores.shape[0] == 1, (
+            f"NGCLogitsProcessor expects batch size 1, got {scores.shape[0]}"
+        )
         return scores + torch.tensor(bias_np, device=scores.device, dtype=scores.dtype).unsqueeze(0)
     
     @property
@@ -164,7 +194,6 @@ class ScoringBridge:
         self._total_gated = 0
     
     def _tokenize_smart(self, text: str, max_tokens: int = 48) -> List[str]:
-        import re
         return re.findall(r"[a-zA-Z]+(?:'[a-z]+)?|[0-9]+(?:\.[0-9]+)?", text.lower())[-max_tokens:]
     
     def _encode_and_settle(self, tokens, settle_steps, learn=False):
@@ -196,21 +225,24 @@ class ScoringBridge:
         fhrr_sims = []
         for choice in choices:
             ct = self._tokenize_smart(choice, max_tokens=32)
-            cf = self.field.encoder.encode_sequence(ct) if ct else np.ones(self.field.fhrr_dim, dtype=np.complex64)
-            fhrr_sims.append(self.field.encoder.similarity(pf, cf))
+            enc_c = (
+                self.field.encoder.encode_sequence(ct)
+                if ct
+                else np.ones(self.field.fhrr_dim, dtype=np.complex64)
+            )
+            fhrr_sims.append(self.field.encoder.similarity(pf, enc_c))
         
         # 3. NGC energy
         self._encode_and_settle(pt, settle_steps=self.context_settle_steps, learn=True)
-        saved = [(l.z.copy(), l.z_bar.copy(), l.error.copy()) for l in self.field.ngc.layers]
-        saved_W = [W.copy() for W in self.field.ngc.W]
-        saved_E = [E.copy() for E in self.field.ngc.E]
+        base_state = self.field.ngc.save_state()
         ngc_energies = []
         for choice in choices:
-            for i, (z, zb, e) in enumerate(saved):
-                self.field.ngc.layers[i].z, self.field.ngc.layers[i].z_bar, self.field.ngc.layers[i].error = z.copy(), zb.copy(), e.copy()
-            for i, W in enumerate(saved_W): self.field.ngc.W[i] = W.copy()
-            for i, E in enumerate(saved_E): self.field.ngc.E[i] = E.copy()
-            r = self._encode_and_settle(self._tokenize_smart(prompt + " " + choice, 64), self.choice_settle_steps, False)
+            self.field.ngc.restore_state(base_state)
+            r = self._encode_and_settle(
+                self._tokenize_smart(prompt + " " + choice, 64),
+                self.choice_settle_steps,
+                False,
+            )
             ngc_energies.append(-r["energy"])
         
         # 4. Combine
@@ -248,24 +280,20 @@ class ScoringBridge:
                     for i in range(len(choices))]
         pt = self._tokenize_smart(prompt, 64)
         pf = self.field.encoder.encode_sequence(pt) if pt else np.ones(self.field.fhrr_dim, dtype=np.complex64)
-        return [self.field.encoder.similarity(pf, self.field.encoder.encode_sequence(
-            self._tokenize_smart(c, 32)) if self._tokenize_smart(c, 32) else np.ones(self.field.fhrr_dim, dtype=np.complex64))
-            for c in choices]
+        out = []
+        for c in choices:
+            ct = self._tokenize_smart(c, 32)
+            enc = self.field.encoder.encode_sequence(ct) if ct else np.ones(self.field.fhrr_dim, dtype=np.complex64)
+            out.append(self.field.encoder.similarity(pf, enc))
+        return out
     
     def reset(self):
-        self.field.ngc._initialized = False
-        self.field.ngc.layers = []
-        self.field.memory.patterns = []
-        self.field.memory._dirty = True
+        self.field.ngc.reinitialize(12345)
+        self.field.memory.patterns.clear()
         self.field.memory._matrix = None
-        self.field.energy_history = []
+        self.field.memory._dirty = True
+        self.field.energy_history.clear()
         self.field._step_count = 0
-        rng = np.random.RandomState(12345)
-        for ell in range(self.field.ngc.n_layers - 1):
-            fi, fo = self.field.ngc.layer_sizes[ell + 1], self.field.ngc.layer_sizes[ell]
-            sc = np.sqrt(2.0 / (fi + fo))
-            self.field.ngc.W[ell] = rng.randn(fo, fi).astype(np.float64) * sc
-            self.field.ngc.E[ell] = self.field.ngc.W[ell].T.copy()
     
     @property
     def statistics(self):

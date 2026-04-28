@@ -15,8 +15,46 @@ when an energy-based readout of SCM fit is required.
 """
 
 import numpy as np
-from typing import Dict, List, Optional, Any, Tuple
+from typing import Dict, List, Any
 from tensegrity.causal.scm import StructuralCausalModel
+
+
+def _require_parent_observations(
+    observations: Dict[str, int],
+    parents: List[str],
+    mechanism_name: str,
+) -> Dict[str, int]:
+    """Build parent_vals from observations or raise if any parent is missing."""
+    parent_vals: Dict[str, int] = {}
+    missing = [p for p in parents if p not in observations]
+    if missing:
+        raise ValueError(
+            f"CausalEnergyTerm: mechanism '{mechanism_name}' requires parent values "
+            f"{parents}; missing observations for {missing}"
+        )
+    for p in parents:
+        parent_vals[p] = observations[p]
+    return parent_vals
+
+
+def _normalized_entropy_tension_from_energy_values(vals: np.ndarray, beta: float) -> float:
+    """
+    Map raw per-model energies to softmax weights over ``-beta * energy`` and return
+    normalized entropy in [0, 1] (same convention as ``EnergyCausalArena.compete`` / ``tension``).
+    """
+    if vals.size == 0:
+        return 1.0
+    neg_e = -beta * vals
+    neg_e -= neg_e.max()
+    w = np.exp(neg_e)
+    s = w.sum()
+    if s <= 0:
+        return 1.0
+    w = w / s
+    w = w[w > 0]
+    if len(w) > 1:
+        return float(-np.sum(w * np.log(w)) / np.log(len(w)))
+    return 0.0
 
 
 class CausalEnergyTerm:
@@ -47,7 +85,9 @@ class CausalEnergyTerm:
                 continue
             
             mech = self.scm.mechanisms[var]
-            parent_vals = {p: observations.get(p, 0) for p in mech.parents}
+            parent_vals = _require_parent_observations(
+                observations, mech.parents, mech.name,
+            )
             
             # Expected value under the CPT
             cpt = mech.cpt
@@ -71,7 +111,9 @@ class CausalEnergyTerm:
         if mech is None:
             return np.array([1.0])
         
-        parent_vals = {p: observations.get(p, 0) for p in mech.parents}
+        parent_vals = _require_parent_observations(
+            observations, mech.parents, mech.name,
+        )
         config_idx = mech.parent_config_index(parent_vals)
         return mech.cpt[:, config_idx]
 
@@ -94,9 +136,15 @@ class EnergyCausalArena:
     
     def register(self, scm: StructuralCausalModel):
         """Add a competing causal model."""
+        if scm.name in self.models:
+            raise ValueError(
+                f"EnergyCausalArena.register: model name {scm.name!r} is already registered"
+            )
         self.models[scm.name] = CausalEnergyTerm(scm, self.precision)
     
-    def compete(self, observations: Dict[str, int]) -> Dict[str, Any]:
+    def compete(
+        self, observations: Dict[str, int], record_history: bool = True,
+    ) -> Dict[str, Any]:
         """
         All models compute their causal energy on the observation.
         Returns energies, posteriors, and tension.
@@ -116,14 +164,7 @@ class EnergyCausalArena:
         weights /= weights.sum()
         
         posteriors = dict(zip(energies.keys(), weights.tolist()))
-        
-        # Tension = normalized entropy
-        probs = weights[weights > 0]
-        if len(probs) > 1:
-            entropy = -np.sum(probs * np.log(probs))
-            tension = float(entropy / np.log(len(probs)))
-        else:
-            tension = 0.0
+        tension = _normalized_entropy_tension_from_energy_values(vals, self.beta)
         
         winner = min(energies, key=energies.get)
         best_energy = energies[winner]
@@ -135,13 +176,14 @@ class EnergyCausalArena:
             "energies": energies,
             "best_energy": best_energy,
         }
-        self._history.append(energies)
+        if record_history:
+            self._history.append(energies)
         
         return result
     
     def best_energy(self, observations: Dict[str, int]) -> float:
         """Get the energy of the best-fitting model."""
-        result = self.compete(observations)
+        result = self.compete(observations, record_history=False)
         return result.get("best_energy", 0.0)
     
     def update_models(self, observations: Dict[str, int]):
@@ -156,11 +198,4 @@ class EnergyCausalArena:
             return 1.0
         last = self._history[-1]
         vals = np.array(list(last.values()))
-        neg_e = -self.beta * vals
-        neg_e -= neg_e.max()
-        w = np.exp(neg_e)
-        w /= w.sum()
-        w = w[w > 0]
-        if len(w) > 1:
-            return float(-np.sum(w * np.log(w)) / np.log(len(w)))
-        return 0.0
+        return _normalized_entropy_tension_from_energy_values(vals, self.beta)

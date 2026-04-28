@@ -10,15 +10,16 @@ This is Friston's Free Energy Principle implemented as it was meant to be:
 not as a flat POMDP solver, but as a hierarchical generative model where
 each level explains away the residuals of the level below.
 
-The energy functional (from Ororbia & Kelly, arXiv:2310.15177):
+The energy functional (from Ororbia & Kelly, arXiv:2310.15177), integrating
+the precision-weighted residuals with correct scaling:
 
-    ℱ(Θ) = Σ_ℓ (1 / 2Σℓ) Σᵢ (zℓᵢ(t) - z̄ℓᵢ)²
+    ℱ(Θ) ≈ Σ_ℓ (1 / 2 ρℓ²) · ||eℓ||²   with   eℓ = ρℓ · (zℓ − z̄ℓ)
 
 Where:
     zℓ      = actual state at layer ℓ  
     z̄ℓ      = W^ℓ · φ(z^{ℓ+1})  = prediction from layer above
-    eℓ      = (1/Σℓ)(zℓ - z̄ℓ)    = precision-weighted prediction error
-    Σℓ      = precision (confidence) at layer ℓ
+    ρℓ      = precision = 1 / σℓ²  (inverse variance; higher = trust layer more)
+    eℓ      = ρℓ · (zℓ − z̄ℓ)        = precision-weighted prediction error
 
 State dynamics (settling toward VFE minimum):
     τ · ∂zℓ/∂t = -γ·zℓ + dℓ ⊙ fD(zℓ) - eℓ
@@ -31,18 +32,34 @@ This is ALL local computation. No gradient chain. Each layer only needs
 its own state, the prediction from above, and the error from below.
 """
 
+import logging
 import numpy as np
 from typing import Optional, List, Dict, Any, Tuple, Callable
 from dataclasses import dataclass, field
+from collections import deque
+
+logger = logging.getLogger(__name__)
 
 
+def _spectral_norm_power_iteration(A: np.ndarray, n_iters: int = 4) -> float:
+    """Approximate largest singular value via power iteration."""
+    m, n = A.shape
+    rng = np.random.RandomState(424242)
+    v = rng.randn(n).astype(np.float64)
+    v /= np.linalg.norm(v) + 1e-12
+    for _ in range(max(1, n_iters)):
+        u = A @ v
+        u /= np.linalg.norm(u) + 1e-12
+        v = A.T @ u
+        v /= np.linalg.norm(v) + 1e-12
+    return float(np.linalg.norm(A @ v))
 @dataclass
 class LayerState:
     """State of a single predictive coding layer."""
     z: np.ndarray           # State neurons (current belief about this level)
     z_bar: np.ndarray       # Top-down prediction (from layer above)
-    error: np.ndarray       # Prediction error: precision * (z - z_bar)
-    precision: float        # 1/Σ — how much to trust this layer's errors
+    error: np.ndarray       # Precision-weighted mismatch: ρ · (z − z̄)
+    precision: float        # ρ = 1 / σ² — inverse variance for this layer (higher = sharper trust)
     energy: float = 0.0     # Local contribution to VFE
     
 
@@ -55,7 +72,7 @@ class PredictiveCodingCircuit:
     
     Information flow:
       Top-down:  z̄ℓ = Wℓ · φ(z^{ℓ+1})     (predictions flow down)
-      Bottom-up: eℓ = (1/Σℓ)(zℓ - z̄ℓ)       (errors flow up)
+      Bottom-up: eℓ = ρℓ · (zℓ − z̄ℓ)   (ρℓ = 1/σ²)
       Lateral:   dℓ = Eℓ · e^{ℓ-1}           (feedback corrections)
     
     All computation is local. No backpropagation.
@@ -75,13 +92,14 @@ class PredictiveCodingCircuit:
                  adaptive_precision: bool = True,
                  precision_momentum: float = 0.9,
                  precision_min: float = 0.1,
-                 precision_max: float = 100.0):
+                 precision_max: float = 100.0,
+                 max_history_length: int = 2000):
         """
         Args:
             layer_sizes: [dim_sensory, dim_hidden1, ..., dim_top]
                         e.g., [2048, 512, 128, 32] for a 4-layer hierarchy
-            precisions: Per-layer precision (1/variance). Higher = more trusted.
-                       If None, defaults to 1.0 everywhere.
+            precisions: Per-layer precision ρ = 1/σ² (inverse variance). Higher = more trust.
+                       If None, defaults to 1.0 everywhere. Length must equal ``n_layers`` when given.
             tau: Membrane time constant (settling speed)
             gamma: State decay rate (leaky integration)
             settle_steps: How many steps to run before declaring convergence
@@ -92,6 +110,7 @@ class PredictiveCodingCircuit:
             adaptive_precision: If True, update precisions from prediction-error variance in learn()
             precision_momentum: EMA factor for precision updates (higher = slower change)
             precision_min / precision_max: Clamp learned precisions
+            max_history_length: Max entries retained in energy / error history (ring buffer)
         """
         self.n_layers = len(layer_sizes)
         self.layer_sizes = layer_sizes
@@ -105,15 +124,20 @@ class PredictiveCodingCircuit:
         self.precision_momentum = precision_momentum
         self.precision_min = precision_min
         self.precision_max = precision_max
+        self.max_history_length = max(1, int(max_history_length))
         
         # Activation function
         self._phi, self._phi_deriv = self._get_activation(activation)
         
-        # Precisions (per layer)
+        # Precisions (per layer): ρ = 1/σ²
         if precisions is None:
             self.precisions = [1.0] * self.n_layers
         else:
-            self.precisions = precisions
+            if len(precisions) != self.n_layers:
+                raise ValueError(
+                    f"precisions must have length n_layers={self.n_layers}, got {len(precisions)}"
+                )
+            self.precisions = list(precisions)
         
         # Generative weights W[ℓ]: maps layer ℓ+1 → prediction of layer ℓ
         # W[ℓ] has shape (layer_sizes[ℓ], layer_sizes[ℓ+1])
@@ -137,9 +161,9 @@ class PredictiveCodingCircuit:
         self.layers: List[LayerState] = []
         self._initialized = False
         
-        # Energy tracking
-        self.energy_history: List[float] = []
-        self.error_history: List[List[float]] = []  # Per-layer error norms
+        # Energy tracking (bounded)
+        self.energy_history: deque = deque(maxlen=self.max_history_length)
+        self.error_history: deque = deque(maxlen=self.max_history_length)
         
         # Warm-start: last observation for change detection
         self._last_obs: Optional[np.ndarray] = None
@@ -226,16 +250,17 @@ class PredictiveCodingCircuit:
         Returns:
             Settling diagnostics
         """
-        obs = np.asarray(observation, dtype=np.float64)
-        if len(obs) != self.layer_sizes[0]:
-            # Project to sensory dimension
-            if len(obs) > self.layer_sizes[0]:
-                obs = obs[:self.layer_sizes[0]]
-            else:
-                padded = np.zeros(self.layer_sizes[0], dtype=np.float64)
-                padded[:len(obs)] = obs
-                obs = padded
-        
+        obs = np.asarray(observation, dtype=np.float64).ravel()
+        need = self.layer_sizes[0]
+        if obs.size != need:
+            logger.warning(
+                "PredictiveCodingCircuit.settle: len(obs)=%s != expected sensory width %s",
+                obs.size,
+                need,
+            )
+            raise ValueError(
+                f"observation length {obs.size} must match layer_sizes[0]={need}"
+            )
         obs_changed = True
         if self._last_obs is not None and self._last_obs.shape == obs.shape:
             if float(np.linalg.norm(obs - self._last_obs)) <= self.obs_change_threshold:
@@ -291,7 +316,8 @@ class PredictiveCodingCircuit:
             step_error_norms = []
             for ell in range(self.n_layers):
                 e = self.layers[ell].error
-                layer_energy = 0.5 * np.dot(e, e) / max(self.precisions[ell], 1e-8)
+                prec = max(self.precisions[ell], 1e-8)
+                layer_energy = 0.5 * np.dot(e, e) / (prec ** 2)
                 self.layers[ell].energy = layer_energy
                 total_energy += layer_energy
                 step_error_norms.append(float(np.linalg.norm(e)))
@@ -330,7 +356,8 @@ class PredictiveCodingCircuit:
         
         if self.adaptive_precision and self.layers:
             for ell in range(self.n_layers):
-                sq_error = float(np.mean(self.layers[ell].error ** 2))
+                residual = self.layers[ell].z - self.layers[ell].z_bar
+                sq_error = float(np.mean(residual ** 2))
                 target_precision = 1.0 / max(sq_error, 1e-6)
                 mom = self.precision_momentum
                 self.precisions[ell] = mom * self.precisions[ell] + (1.0 - mom) * target_precision
@@ -351,13 +378,69 @@ class PredictiveCodingCircuit:
             dE = np.outer(self.layers[ell + 1].z, error_below)
             self.E[ell] += effective_lr * dE - effective_lr * self.gamma * self.E[ell]
             
-            # Spectral normalization: cap the largest singular value at 1.0
-            w_norm = np.linalg.norm(self.W[ell], ord=2)
+            # Spectral normalization (power iteration — cheaper than full SVD)
+            w_norm = _spectral_norm_power_iteration(self.W[ell])
             if w_norm > 1.0:
                 self.W[ell] /= w_norm
-            e_norm = np.linalg.norm(self.E[ell], ord=2)
+            e_norm = _spectral_norm_power_iteration(self.E[ell])
             if e_norm > 1.0:
                 self.E[ell] /= e_norm
+    
+    def clear_history(self) -> None:
+        """Drop recorded energy / error traces."""
+        self.energy_history.clear()
+        self.error_history.clear()
+    
+    def reinitialize(self, weight_seed: int = 12345) -> None:
+        """Reset layer states and resample W/E."""
+        rng = np.random.RandomState(weight_seed)
+        self.layers = []
+        self._initialized = False
+        self._last_obs = None
+        self.clear_history()
+        for ell in range(self.n_layers - 1):
+            fan_in = self.layer_sizes[ell + 1]
+            fan_out = self.layer_sizes[ell]
+            scale = np.sqrt(2.0 / (fan_in + fan_out))
+            self.W[ell] = rng.randn(fan_out, fan_in).astype(np.float64) * scale
+            self.E[ell] = self.W[ell].T.copy()
+    
+    def save_state(self) -> Dict[str, Any]:
+        """Snapshot weights and layer activations."""
+        layer_snap = [
+            (
+                l.z.copy(),
+                l.z_bar.copy(),
+                l.error.copy(),
+                float(l.precision),
+                float(l.energy),
+            )
+            for l in self.layers
+        ]
+        return {
+            "layers": layer_snap,
+            "W": [w.copy() for w in self.W],
+            "E": [e.copy() for e in self.E],
+            "precisions": list(self.precisions),
+            "_initialized": self._initialized,
+            "_last_obs": None if self._last_obs is None else self._last_obs.copy(),
+        }
+    
+    def restore_state(self, state: Dict[str, Any]) -> None:
+        """Restore from ``save_state()``."""
+        self.precisions = list(state["precisions"])
+        self.W = [w.copy() for w in state["W"]]
+        self.E = [e.copy() for e in state["E"]]
+        self._initialized = bool(state["_initialized"])
+        lo = state["_last_obs"]
+        self._last_obs = None if lo is None else np.asarray(lo, dtype=np.float64).copy()
+        self.layers = []
+        for z, zb, er, prec, ener in state["layers"]:
+            self.layers.append(
+                LayerState(
+                    z=z, z_bar=zb, error=er, precision=prec, energy=ener,
+                )
+            )
     
     def predict_observation(self) -> np.ndarray:
         """

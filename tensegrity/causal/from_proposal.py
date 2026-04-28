@@ -16,20 +16,27 @@ logger = logging.getLogger(__name__)
 def build_scm_from_proposal(proposal: ProposedSCM, n_values: int = 4) -> StructuralCausalModel:
     """
     Convert a ProposedSCM into a StructuralCausalModel with discrete variables.
-    Drops edges that would create cycles. Variable order follows a topological sort.
+    Edges from ``proposal.edges`` are applied in **forward list order**. Each edge is
+    kept unless adding it breaks acyclicity; if ``G.add_edge`` would introduce a cycle,
+    that edge is dropped (``G.remove_edge``) and a debug log is emitted — earlier edges
+    are never removed. Variable order follows a topological sort when the retained graph is non-empty.
     """
+    if not isinstance(n_values, int):
+        raise TypeError(f"n_values must be int, got {type(n_values).__name__}")
+    if n_values <= 0:
+        raise ValueError(f"n_values must be a positive integer, got {n_values}")
     G = nx.DiGraph()
     for e in proposal.edges:
         G.add_edge(e.source.strip(), e.target.strip())
 
     if G.number_of_nodes() == 0:
         logger.warning("ProposedSCM '%s' has no edges; returning empty SCM", proposal.name)
-        scm = StructuralCausalModel(name=proposal.name[:60])
+        scm = StructuralCausalModel(name=proposal.name[:60].replace(" ", "_"))
         scm.add_variable("observation", n_values=n_values, parents=[])
         return scm
 
     if not nx.is_directed_acyclic_graph(G):
-        # Greedily remove edges that introduce cycles (reverse insertion order)
+        # Forward-order greedy cycle breaking: keep earlier edges_in_list, drop later ones that close a cycle.
         edges_list = [(e.source.strip(), e.target.strip()) for e in proposal.edges]
         G.clear()
         for s, t in edges_list:
