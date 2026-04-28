@@ -268,6 +268,7 @@ class TensegrityLogitsProcessor:
         """
         self._step_count += 1
         self.state.step = self._step_count
+        _ensure_torch()
         
         if self.async_beliefs:
             with self._bias_lock:
@@ -281,7 +282,6 @@ class TensegrityLogitsProcessor:
             return scores
         
         bias = torch.tensor(bias_np, device=scores.device, dtype=scores.dtype)
-        _ensure_torch()
         assert scores.shape[0] == 1, (
             f"TensegrityLogitsProcessor expects batch size 1, got {scores.shape[0]}"
         )

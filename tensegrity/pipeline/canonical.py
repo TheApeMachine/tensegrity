@@ -133,3 +133,4 @@ class CanonicalPipeline:
         a = np.log(agent_probs + 1e-12)
         za = (a - a.mean()) / (a.std() + 1e-8)
         return zf + self.belief_blend * za
+
