@@ -2,8 +2,6 @@
 Tests for the unified cognitive engine: FHRR, NGC, and UnifiedField.
 """
 
-import sys
-sys.path.insert(0, '/app')
 import numpy as np
 np.random.seed(42)
 
@@ -28,7 +26,8 @@ def test_fhrr_encoding():
     
     print(f"  sim(pos=10, pos=11)  = {sim_close:.4f}")
     print(f"  sim(pos=10, pos=100) = {sim_far:.4f}")
-    print(f"  ✓ Close positions more similar than distant ones")
+    assert np.isfinite(sim_close)
+    assert np.isfinite(sim_far)
     
     # Test binding + unbinding: encode "red ball on table"
     obs = enc.encode_observation({
@@ -65,11 +64,12 @@ def test_fhrr_encoding():
     v_near = enc.encode_numeric_vector(np.array([1.0, 2.0, 3.1]))
     v_far = enc.encode_numeric_vector(np.array([9.0, 8.0, 7.0]))
     
-    print(f"\n  sim([1,2,3], [1,2,3.1]) = {enc.similarity(v_base, v_near):.4f}")
-    print(f"  sim([1,2,3], [9,8,7])   = {enc.similarity(v_base, v_far):.4f}")
+    sim_near = enc.similarity(v_base, v_near)
+    sim_numeric_far = enc.similarity(v_base, v_far)
+    print(f"\n  sim([1,2,3], [1,2,3.1]) = {sim_near:.4f}")
+    print(f"  sim([1,2,3], [9,8,7])   = {sim_numeric_far:.4f}")
+    assert sim_near > sim_numeric_far
     print(f"  ✓ Numeric vectors: similar inputs → similar encodings")
-    
-    return True
 
 
 def test_predictive_coding():
@@ -130,6 +130,8 @@ def test_predictive_coding():
     pe_late = np.mean(prediction_errors[-5:])
     print(f"  Mean PE (early): {pe_early:.4f}")
     print(f"  Mean PE (late):  {pe_late:.4f}")
+    assert np.all(np.isfinite(energies))
+    assert pe_late < pe_early, "Prediction error should decrease after Hebbian updates"
     
     # THE KEY TEST: the system now PREDICTS its input
     predicted = ngc.predict_observation()
@@ -137,9 +139,7 @@ def test_predictive_coding():
     print(f"\n  Prediction norm: {residual:.4f} (>0 means the system has learned to predict)")
     assert residual > 0.01, "System should generate non-trivial predictions"
     print(f"  ✓ System generates predictions of sensory input")
-    print(f"  ✓ Energy decreases via Hebbian learning (no backprop)")
-    
-    return True
+    print(f"  ✓ Prediction error decreases via Hebbian learning (no backprop)")
 
 
 def test_unified_field():
@@ -191,6 +191,8 @@ def test_unified_field():
     
     # Memory should recall the repeated pattern
     print(f"\n  Memory patterns stored: {field.memory.n_patterns}")
+    assert field.memory.n_patterns == len(observations)
+    assert pe_list[-1] < pe_list[0]
     
     # Make a prediction before seeing the next observation
     predicted = field.predict()
@@ -202,9 +204,8 @@ def test_unified_field():
     result = field.observe("the red ball is on the table", input_type="text")
     print(f"  Text: 'the red ball is on the table'")
     print(f"  Energy: {result['energy'].total:.4f}")
+    assert np.isfinite(result["energy"].total)
     print(f"  ✓ Modality-agnostic: same pipeline handles structured and text input")
-    
-    return True
 
 
 def main():
@@ -240,3 +241,5 @@ def main():
 if __name__ == "__main__":
     ok = main()
     sys.exit(0 if ok else 1)
+
+

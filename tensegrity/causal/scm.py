@@ -20,8 +20,9 @@ Implementation: Each SCM is a networkx DiGraph where nodes carry:
 
 import numpy as np
 import networkx as nx
-from typing import Dict, Optional, Callable, List, Any, Tuple, Set
+from typing import Dict, Optional, List, Tuple, Set
 from copy import deepcopy
+from itertools import product
 
 
 class CausalMechanism:
@@ -32,21 +33,28 @@ class CausalMechanism:
     For continuous variables: parameterized as an Additive Noise Model (ANM).
     """
     
-    def __init__(self, name: str, n_values: int = 4,
-                 parents: Optional[List[str]] = None,
-                 noise_scale: float = 0.1):
+    def __init__(
+        self, name: str, n_values: int = 4,
+        parents: Optional[List[str]] = None,
+        noise_scale: float = 0.1,
+        parent_cardinalities: Optional[List[int]] = None,
+    ) -> None:
         self.name = name
         self.n_values = n_values  # Discrete cardinality
         self.parents = parents or []
+        self.parent_cardinalities = list(parent_cardinalities or [n_values] * len(self.parents))
+        
+        if len(self.parent_cardinalities) != len(self.parents):
+            raise ValueError("parent_cardinalities must match parents")
+        
         self.noise_scale = noise_scale
         
         # Conditional Probability Table (Dirichlet-parameterized)
         # Shape: (n_values, n_parent_configs)
-        if self.parents:
-            # For now, assume each parent has n_values states
-            n_parent_configs = n_values ** len(self.parents)
-        else:
-            n_parent_configs = 1
+        n_parent_configs = 1
+        
+        for card in self.parent_cardinalities:
+            n_parent_configs *= max(int(card), 1)
         
         # Initialize CPT as uniform Dirichlet
         self.cpt_params = np.ones((n_values, n_parent_configs))
@@ -68,8 +76,13 @@ class CausalMechanism:
             return 0
         
         idx = 0
-        for i, p in enumerate(self.parents):
-            idx += parent_values.get(p, 0) * (self.n_values ** i)
+        stride = 1
+        
+        for p, card in zip(self.parents, self.parent_cardinalities):
+            value = int(parent_values.get(p, 0))
+            idx += (value % max(int(card), 1)) * stride
+            stride *= max(int(card), 1)
+        
         return idx % self.cpt_params.shape[1]
     
     def sample(self, parent_values: Dict[str, int]) -> int:
@@ -80,12 +93,23 @@ class CausalMechanism:
     
     def log_prob(self, value: int, parent_values: Dict[str, int]) -> float:
         """Compute log P(V_i = value | parents)."""
+        value = int(value)
+
+        if value < 0 or value >= self.n_values:
+            return float(np.log(1e-16))
+
         config_idx = self.parent_config_index(parent_values)
         probs = self.cpt[:, config_idx]
+
         return float(np.log(max(probs[value], 1e-16)))
     
     def update(self, value: int, parent_values: Dict[str, int]):
         """Bayesian update: increment Dirichlet parameter."""
+        value = int(value)
+        
+        if value < 0 or value >= self.n_values:
+            return
+        
         config_idx = self.parent_config_index(parent_values)
         self.cpt_params[value, config_idx] += 1.0
     
@@ -103,6 +127,7 @@ class CausalMechanism:
         noise = np.zeros(self.n_values)
         noise[value] = 1.0
         self.abduced_noise = noise
+        
         return noise
 
 
@@ -128,15 +153,26 @@ class StructuralCausalModel:
                      noise_scale: float = 0.1):
         """Add a variable with its causal mechanism."""
         parents = parents or []
+
+        for parent in parents:
+            if parent not in self.graph:
+                # Auto-create parent as root node with the child's cardinality.
+                self.add_variable(parent, n_values)
+
+        parent_cardinalities = [self.mechanisms[p].n_values for p in parents]
         
-        mechanism = CausalMechanism(name, n_values, parents, noise_scale)
+        mechanism = CausalMechanism(
+            name,
+            n_values,
+            parents,
+            noise_scale,
+            parent_cardinalities=parent_cardinalities,
+        )
+
         self.mechanisms[name] = mechanism
         self.graph.add_node(name, mechanism=mechanism)
         
         for parent in parents:
-            if parent not in self.graph:
-                # Auto-create parent as root node
-                self.add_variable(parent, n_values)
             self.graph.add_edge(parent, name)
     
     def topological_order(self) -> List[str]:
@@ -154,10 +190,12 @@ class StructuralCausalModel:
         
         for _ in range(n_samples):
             values = {}
+
             for var in order:
                 mech = self.mechanisms[var]
                 parent_vals = {p: values[p] for p in mech.parents if p in values}
                 values[var] = mech.sample(parent_vals)
+
             samples.append(values)
         
         return samples
@@ -166,10 +204,9 @@ class StructuralCausalModel:
         """
         Rung 1 — Association: Compute P(query | evidence).
         
-        Uses likelihood weighting (importance sampling) since exact
-        inference on general DAGs is NP-hard.
-        
-        Returns log-likelihood of the evidence under the model.
+        Returns the exact finite-discrete log-likelihood of the evidence under
+        the model by marginalizing unobserved variables. Unknown evidence keys
+        are ignored to preserve the previous tolerant public behavior.
         """
         self._observed.update(evidence)
         
@@ -177,18 +214,8 @@ class StructuralCausalModel:
         for var, val in evidence.items():
             if var in self.mechanisms:
                 self.mechanisms[var].value = val
-        
-        # Compute joint log-probability of evidence
-        order = self.topological_order()
-        log_prob = 0.0
-        
-        for var in order:
-            if var in evidence:
-                mech = self.mechanisms[var]
-                parent_vals = {p: evidence.get(p, 0) for p in mech.parents}
-                log_prob += mech.log_prob(evidence[var], parent_vals)
-        
-        return {'log_likelihood': log_prob}
+
+        return {'log_likelihood': self.log_evidence([evidence])}
     
     def do(self, interventions: Dict[str, int]) -> 'StructuralCausalModel':
         """
@@ -209,13 +236,19 @@ class StructuralCausalModel:
             
             # Remove all incoming edges (graph surgery)
             parents = list(mutilated.graph.predecessors(var))
+
             for parent in parents:
                 mutilated.graph.remove_edge(parent, var)
             
             # Fix the mechanism to produce the intervention value deterministically
             mech = mutilated.mechanisms[var]
             mech.parents = []
+            mech.parent_cardinalities = []
+
             # Set CPT to delta function at intervention value
+            if val < 0 or val >= mech.n_values:
+                raise ValueError(f"Intervention value {val} out of range for {var}")
+
             mech.cpt_params = np.zeros((mech.n_values, 1))
             mech.cpt_params[val, 0] = 1000.0  # Strong prior = near-deterministic
             mech.value = val
@@ -235,46 +268,76 @@ class StructuralCausalModel:
         
         Returns distribution over query variables in the counterfactual world.
         """
-        # Step 1: ABDUCTION — infer noise for each mechanism
+        for var, val in interventions.items():
+            if var in self.mechanisms:
+                n_values = self.mechanisms[var].n_values
+                if val < 0 or val >= n_values:
+                    raise ValueError(f"Intervention value {val} out of range for {var}")
+
+        cf_results = {
+            q: np.zeros(self.mechanisms[q].n_values, dtype=np.float64)
+            for q in query
+            if q in self.mechanisms
+        }
+
+        if not cf_results:
+            return {}
+
+        posterior_worlds = self._posterior_assignments(evidence)
+        if not posterior_worlds:
+            return cf_results
+
         order = self.topological_order()
-        for var in order:
-            if var in evidence:
-                mech = self.mechanisms[var]
-                parent_vals = {p: evidence.get(p, 0) for p in mech.parents}
-                mech.abduce(evidence[var], parent_vals)
-        
-        # Step 2: INTERVENTION — create mutilated model
-        cf_model = self.do(interventions)
-        
-        # Step 3: PREDICTION — forward sample with abduced noise
-        n_cf_samples = 1000
-        cf_results = {q: np.zeros(self.mechanisms[q].n_values) for q in query}
-        
-        for _ in range(n_cf_samples):
-            values = {}
-            for var in cf_model.topological_order():
-                mech_cf = cf_model.mechanisms[var]
-                mech_orig = self.mechanisms[var]
-                
-                if var in interventions:
-                    values[var] = interventions[var]
-                elif mech_orig.abduced_noise is not None:
-                    # Use abduced noise
-                    values[var] = int(np.random.choice(
-                        mech_cf.n_values, p=mech_orig.abduced_noise))
-                else:
-                    parent_vals = {p: values.get(p, 0) for p in mech_cf.parents}
-                    values[var] = mech_cf.sample(parent_vals)
-                
-                if var in cf_results:
-                    cf_results[var][values[var]] += 1
-        
-        # Normalize to distributions
-        for var in cf_results:
-            total = cf_results[var].sum()
+        affected: Set[str] = set()
+        for var in interventions:
+            if var in self.graph:
+                affected.add(var)
+                affected.update(nx.descendants(self.graph, var))
+
+        for posterior_assignment, posterior_weight in posterior_worlds:
+            worlds: List[Tuple[Dict[str, int], float]] = [({}, posterior_weight)]
+
+            for var in order:
+                next_worlds: List[Tuple[Dict[str, int], float]] = []
+
+                for values, weight in worlds:
+                    if var in interventions:
+                        v = int(interventions[var])
+                        updated = dict(values)
+                        updated[var] = v
+                        next_worlds.append((updated, weight))
+                        continue
+
+                    if var not in affected:
+                        # Abduced context outside the intervention's downstream
+                        # cone is held fixed from the posterior factual world.
+                        updated = dict(values)
+                        updated[var] = int(posterior_assignment[var])
+                        next_worlds.append((updated, weight))
+                        continue
+
+                    mech = self.mechanisms[var]
+                    parent_vals = {p: values[p] for p in mech.parents}
+                    probs = mech.cpt[:, mech.parent_config_index(parent_vals)]
+
+                    for v, p_v in enumerate(probs):
+                        if p_v <= 0:
+                            continue
+                        updated = dict(values)
+                        updated[var] = int(v)
+                        next_worlds.append((updated, weight * float(p_v)))
+
+                worlds = next_worlds
+
+            for values, weight in worlds:
+                for q in cf_results:
+                    cf_results[q][values[q]] += weight
+
+        for var, dist in cf_results.items():
+            total = float(dist.sum())
             if total > 0:
-                cf_results[var] /= total
-        
+                cf_results[var] = dist / total
+
         return cf_results
     
     def log_evidence(self, data: List[Dict[str, int]]) -> float:
@@ -284,16 +347,76 @@ class StructuralCausalModel:
         This is what the causal arena uses to rank competing models.
         """
         total_log_prob = 0.0
-        order = self.topological_order()
         
         for sample in data:
-            for var in order:
-                if var in sample:
-                    mech = self.mechanisms[var]
-                    parent_vals = {p: sample.get(p, 0) for p in mech.parents}
-                    total_log_prob += mech.log_prob(sample[var], parent_vals)
+            likelihood = self._evidence_likelihood(sample)
+            total_log_prob += float(np.log(max(likelihood, 1e-300)))
         
         return total_log_prob
+
+    def _evidence_likelihood(self, evidence: Dict[str, int]) -> float:
+        """Exact P(evidence) for this finite discrete SCM."""
+        known = {
+            var: int(val)
+            for var, val in evidence.items()
+            if var in self.mechanisms
+        }
+
+        for var, val in known.items():
+            n_values = self.mechanisms[var].n_values
+            if val < 0 or val >= n_values:
+                return 0.0
+
+        total = 0.0
+        for assignment, prob in self._enumerate_joint_assignments(known):
+            total += prob
+        return float(total)
+
+    def _joint_probability(self, assignment: Dict[str, int]) -> float:
+        """P(assignment) under the SCM, assuming all variables are assigned."""
+        prob = 1.0
+        for var in self.topological_order():
+            mech = self.mechanisms[var]
+            parent_vals = {p: assignment[p] for p in mech.parents}
+            prob *= float(np.exp(mech.log_prob(assignment[var], parent_vals)))
+            if prob <= 0.0:
+                return 0.0
+        return float(prob)
+
+    def _enumerate_joint_assignments(
+        self,
+        evidence: Optional[Dict[str, int]] = None,
+    ) -> List[Tuple[Dict[str, int], float]]:
+        """Enumerate complete assignments consistent with evidence and their joint probabilities."""
+        evidence = evidence or {}
+        order = self.topological_order()
+        missing = [var for var in order if var not in evidence]
+        domains = [range(self.mechanisms[var].n_values) for var in missing]
+        assignments: List[Tuple[Dict[str, int], float]] = []
+
+        for values in product(*domains):
+            assignment = dict(evidence)
+            assignment.update({var: int(value) for var, value in zip(missing, values)})
+            prob = self._joint_probability(assignment)
+            if prob > 0.0:
+                assignments.append((assignment, prob))
+
+        return assignments
+
+    def _posterior_assignments(self, evidence: Dict[str, int]) -> List[Tuple[Dict[str, int], float]]:
+        """Enumerate complete factual worlds weighted by P(world | evidence)."""
+        known = {
+            var: int(val)
+            for var, val in evidence.items()
+            if var in self.mechanisms
+        }
+        assignments = self._enumerate_joint_assignments(known)
+        total = sum(prob for _, prob in assignments)
+
+        if total <= 0:
+            return []
+
+        return [(assignment, prob / total) for assignment, prob in assignments]
     
     def update_from_data(self, data: List[Dict[str, int]]):
         """
@@ -304,7 +427,9 @@ class StructuralCausalModel:
             for var in self.topological_order():
                 if var in sample:
                     mech = self.mechanisms[var]
-                    parent_vals = {p: sample.get(p, 0) for p in mech.parents}
+                    if any(p not in sample for p in mech.parents):
+                        continue
+                    parent_vals = {p: sample[p] for p in mech.parents}
                     mech.update(sample[var], parent_vals)
     
     def d_separation(self, x: str, y: str, z: Optional[Set[str]] = None) -> bool:
@@ -315,8 +440,8 @@ class StructuralCausalModel:
         """
         z = z or set()
         
-        # Simple implementation via active trail checking
-        return not nx.d_separated(self.graph, {x}, {y}, z)
+        # NetworkX exposes this as ``is_d_separator`` in recent versions.
+        return bool(nx.is_d_separator(self.graph, {x}, {y}, z))
     
     def find_adjustment_set(self, treatment: str, outcome: str) -> Optional[Set[str]]:
         """

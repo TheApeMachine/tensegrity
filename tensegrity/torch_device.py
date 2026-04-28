@@ -21,7 +21,10 @@ def inference_load_settings() -> Tuple[Any, Optional[str], Optional[Any]]:
 
     if torch.cuda.is_available():
         return torch.float16, "auto", None
+    
     mps = getattr(torch.backends, "mps", None)
+    
     if mps is not None and mps.is_available():
         return torch.float16, None, torch.device("mps")
+
     return torch.float32, None, None

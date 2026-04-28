@@ -18,7 +18,7 @@ Two modes:
 """
 
 import numpy as np
-from typing import Dict, List, Optional, Any
+from typing import Callable, Dict, List, Optional, Any
 import logging
 import json
 
@@ -54,6 +54,14 @@ class HybridPipeline:
         entropy_gate: float = 0.85,
         suppress_threshold: float = 0.01,
         async_graft: bool = True,
+        # Semantic grounding is now the default (replaces brittle keyword-to-
+        # token matching with frozen sbert phrase projection — the
+        # "color wheel of meaning" instead of the "phrase book"). If sbert is
+        # not available at runtime we fall back to keyword grounding.
+        semantic_grounding: bool = True,
+        semantic_embedding_fn: Optional[Callable[[str], np.ndarray]] = None,
+        semantic_top_k: int = 32,
+        semantic_threshold: Optional[float] = None,
     ):
         """
         Args:
@@ -68,6 +76,12 @@ class HybridPipeline:
             entropy_gate: Convergence threshold for bias emission
             suppress_threshold: Below this probability → hard suppress
             async_graft: Local mode only — poll beliefs in a background thread for non-blocking decode
+            semantic_grounding: If True, build grounding by frozen semantic
+                phrase/token projection instead of exact keyword tokenization
+            semantic_embedding_fn: Required when semantic_grounding=True; maps
+                text to a fixed embedding vector without runtime training
+            semantic_top_k: Semantic vocabulary tokens retained per hypothesis
+            semantic_threshold: Optional minimum cosine similarity for semantic grounding
         """
         self.hypothesis_labels = hypothesis_labels
         self.model_name = model_name
@@ -76,6 +90,10 @@ class HybridPipeline:
         self.entropy_gate = entropy_gate
         self.suppress_threshold = suppress_threshold
         self.async_graft = async_graft
+        self.semantic_grounding = semantic_grounding
+        self.semantic_embedding_fn = semantic_embedding_fn
+        self.semantic_top_k = semantic_top_k
+        self.semantic_threshold = semantic_threshold
         
         # Initialize cognitive controller (template mode — no LLM for parsing)
         self.controller = CognitiveController(
@@ -95,6 +113,91 @@ class HybridPipeline:
         # Generation tracking
         self._generations = 0
         self._graft_states: List[GraftState] = []
+
+    def _label_phrases(self) -> Dict[str, List[str]]:
+        phrases = {}
+        for label in self.hypothesis_labels:
+            parts = label.replace("_", " ").replace("-", " ").split()
+            phrases[label] = [label.replace("_", " ").replace("-", " ")] + parts
+        return phrases
+
+    def _build_grounding(self) -> VocabularyGrounding:
+        if self.semantic_grounding:
+            embed = self.semantic_embedding_fn or self._default_sbert_embed_fn()
+            if embed is not None:
+                phrases = self._hypothesis_keywords or self._label_phrases()
+                try:
+                    return VocabularyGrounding.from_semantic_projection(
+                        phrases,
+                        self._tokenizer,
+                        embedding_fn=embed,
+                        top_k=self.semantic_top_k,
+                        threshold=self.semantic_threshold,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "semantic grounding failed (%s); falling back to keyword grounding", e
+                    )
+        if self._hypothesis_keywords:
+            return VocabularyGrounding.from_keywords(
+                self._hypothesis_keywords, self._tokenizer)
+        return VocabularyGrounding.from_labels_only(
+            self.hypothesis_labels, self._tokenizer)
+
+    def _default_sbert_embed_fn(self) -> Optional[Callable[[str], np.ndarray]]:
+        """Build a frozen sbert embedding function. Used when the caller did
+        not pass an explicit semantic_embedding_fn. No gradient flow.
+
+        Uses a bulk-prefetch cache: on first invocation, batch-encodes the
+        entire LLM vocabulary in one shot (a few seconds for ~128k tokens
+        on CPU) so the per-token loop in SemanticProjectionLayer.from_tokenizer
+        becomes a dict lookup instead of 128k individual sbert calls.
+        """
+        try:
+            from sentence_transformers import SentenceTransformer
+        except Exception as e:
+            logger.warning("sentence_transformers unavailable (%s); semantic grounding off", e)
+            return None
+        try:
+            model = SentenceTransformer("all-MiniLM-L6-v2")
+        except Exception as e:
+            logger.warning("could not load sbert (%s); semantic grounding off", e)
+            return None
+
+        cache: Dict[str, np.ndarray] = {}
+        bulk_done = [False]
+
+        def _bulk_warm() -> None:
+            if bulk_done[0] or self._tokenizer is None:
+                return
+            try:
+                from tensegrity.graft.vocabulary import _token_texts_from_tokenizer
+                texts = _token_texts_from_tokenizer(self._tokenizer)
+            except Exception as e:
+                logger.debug("vocab text extraction skipped: %s", e)
+                bulk_done[0] = True
+                return
+            uniq = sorted({t for t in texts.values() if isinstance(t, str) and t})
+            if not uniq:
+                bulk_done[0] = True
+                return
+            logger.info("sbert bulk encode: %d unique vocab strings", len(uniq))
+            vecs = model.encode(uniq, batch_size=256, show_progress_bar=False)
+            for t, v in zip(uniq, vecs):
+                cache[t] = np.asarray(v, dtype=np.float32)
+            bulk_done[0] = True
+
+        def embed(text: str) -> np.ndarray:
+            if not bulk_done[0]:
+                _bulk_warm()
+            v = cache.get(text)
+            if v is not None:
+                return v
+            v = np.asarray(model.encode([text], show_progress_bar=False)[0], dtype=np.float32)
+            cache[text] = v
+            return v
+
+        return embed
     
     def _init_local(self):
         """Lazy initialization for local mode (loads model + tokenizer)."""
@@ -115,16 +218,12 @@ class HybridPipeline:
             self._model = self._model.to(move_to)
         
         # Build vocabulary grounding
-        if self._hypothesis_keywords:
-            self._grounding = VocabularyGrounding.from_keywords(
-                self._hypothesis_keywords, self._tokenizer)
-        else:
-            self._grounding = VocabularyGrounding.from_labels_only(
-                self.hypothesis_labels, self._tokenizer)
+        self._grounding = self._build_grounding()
         
         # Build logit processor
         self._processor = TensegrityLogitsProcessor(
             hypothesis_tokens=self._grounding.hypothesis_tokens,
+            hypothesis_token_scores=self._grounding.hypothesis_token_scores,
             belief_fn=self._get_current_beliefs,
             vocab_size=self._tokenizer.vocab_size,
             scale=self.scale,
@@ -144,15 +243,11 @@ class HybridPipeline:
         
         self._tokenizer = AutoTokenizer.from_pretrained(self.model_name)
         
-        if self._hypothesis_keywords:
-            self._grounding = VocabularyGrounding.from_keywords(
-                self._hypothesis_keywords, self._tokenizer)
-        else:
-            self._grounding = VocabularyGrounding.from_labels_only(
-                self.hypothesis_labels, self._tokenizer)
+        self._grounding = self._build_grounding()
         
         self._static_builder = StaticLogitBiasBuilder(
             hypothesis_tokens=self._grounding.hypothesis_tokens,
+            hypothesis_token_scores=self._grounding.hypothesis_token_scores,
             scale=self.scale,
             suppress_threshold=self.suppress_threshold,
         )
@@ -211,18 +306,29 @@ class HybridPipeline:
         
         from transformers import LogitsProcessorList
         
-        # Build the prompt
+        # Build the prompt. Newer transformers may return a BatchEncoding
+        # rather than a bare tensor — unwrap to the input_ids tensor before
+        # passing to model.generate.
+        import torch as _torch
         messages = [{"role": "user", "content": prompt}]
-        input_ids = self._tokenizer.apply_chat_template(
+        encoded = self._tokenizer.apply_chat_template(
             messages, return_tensors="pt", add_generation_prompt=True
         )
-        
+        if isinstance(encoded, _torch.Tensor):
+            input_ids = encoded
+        elif hasattr(encoded, "input_ids"):
+            input_ids = encoded.input_ids
+        elif isinstance(encoded, dict) and "input_ids" in encoded:
+            input_ids = encoded["input_ids"]
+        else:
+            input_ids = _torch.as_tensor(encoded)
+
         if hasattr(self._model, 'device'):
             input_ids = input_ids.to(self._model.device)
-        
+
         # Generate with Tensegrity logit processor
         self._processor._step_count = 0  # Reset step counter
-        
+
         outputs = self._model.generate(
             input_ids,
             logits_processor=LogitsProcessorList([self._processor]),
@@ -231,7 +337,7 @@ class HybridPipeline:
             temperature=0.7,
             pad_token_id=self._tokenizer.eos_token_id,
         )
-        
+
         # Decode only the new tokens
         new_tokens = outputs[0][input_ids.shape[1]:]
         text = self._tokenizer.decode(new_tokens, skip_special_tokens=True)
@@ -393,3 +499,5 @@ class HybridPipeline:
     @property
     def state_summary(self) -> str:
         return self.controller.get_state_summary()
+
+

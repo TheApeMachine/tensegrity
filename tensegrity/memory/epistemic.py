@@ -17,7 +17,7 @@ observed in human semantic memory (Anderson & Schooler, 1991).
 """
 
 import numpy as np
-from typing import Dict, Optional, Tuple, List, Any
+from typing import Dict, List, Any
 from collections import defaultdict
 
 
@@ -203,22 +203,22 @@ class EpistemicMemory:
         return log_lik
     
     def entropy(self) -> Dict[str, float]:
-        """Compute entropy of each belief distribution (uncertainty measure)."""
-        from scipy.stats import dirichlet as dirichlet_dist
-        
-        # A entropy (per state)
-        a_entropy = 0.0
-        for s in range(self.n_states):
-            alpha = self.A_params[:, s]
-            if np.all(alpha > 0):
-                a_entropy += dirichlet_dist.entropy(alpha)
-        
-        # D entropy
-        d_entropy = float(dirichlet_dist.entropy(self.D_params)) if np.all(self.D_params > 0) else 0.0
+        """Compute non-negative categorical entropy of expected beliefs.
+
+        SciPy's Dirichlet differential entropy can be negative, which is
+        mathematically valid for continuous densities but confusing as an
+        uncertainty dashboard metric.  The agent usually wants entropy of the
+        expected categorical distributions it will actually act on.
+        """
+        A = self.A_params / self.A_params.sum(axis=0, keepdims=True)
+        D = self.D_params / self.D_params.sum()
+
+        a_entropy_by_state = -np.sum(A * np.log(np.maximum(A, 1e-16)), axis=0)
+        d_entropy = -np.sum(D * np.log(np.maximum(D, 1e-16)))
         
         return {
-            'likelihood_entropy': float(a_entropy / self.n_states),
-            'initial_state_entropy': d_entropy,
+            'likelihood_entropy': float(np.mean(a_entropy_by_state)),
+            'initial_state_entropy': float(d_entropy),
         }
     
     def snapshot(self) -> Dict[str, Any]:
@@ -237,3 +237,6 @@ class EpistemicMemory:
         self.B_params = snapshot['B_params'].copy()
         self.D_params = snapshot['D_params'].copy()
         self.C = snapshot['C'].copy()
+
+
+

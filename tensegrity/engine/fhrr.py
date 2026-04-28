@@ -46,21 +46,27 @@ class FHRRCodebook:
     def register(self, label: str) -> int:
         if label not in self._labels:
             idx = len(self._labels)
+
             if idx >= self.n_symbols:
                 rng = np.random.RandomState(_stable_label_rng_seed(label))
                 new_phases = rng.uniform(0, 2 * np.pi, size=(256, self.dim))
                 new_vecs = np.exp(1j * new_phases).astype(np.complex64)
                 self.vectors = np.concatenate([self.vectors, new_vecs], axis=0)
                 self.n_symbols += 256
+
             self._labels[label] = idx
+
         return self._labels[label]
     
     def get(self, label_or_idx: Union[str, int]) -> np.ndarray:
         if isinstance(label_or_idx, str):
             idx = self._labels.get(label_or_idx)
+
             if idx is None:
                 idx = self.register(label_or_idx)
+
             return self.vectors[idx]
+
         return self.vectors[label_or_idx]
     
     def inverse(self, label_or_idx: Union[str, int]) -> np.ndarray:
@@ -70,10 +76,22 @@ class FHRRCodebook:
         return float(np.real(np.dot(a, np.conj(b))) / self.dim)
     
     def query(self, probe: np.ndarray, top_k: int = 5) -> List[Tuple[str, float]]:
+        idx_to_label = {v: k for k, v in self._labels.items()}
+
+        if idx_to_label:
+            active_idx = np.array(sorted(idx_to_label), dtype=np.int64)
+            sims_active = np.real(self.vectors[active_idx] @ np.conj(probe)) / self.dim
+            order = np.argsort(sims_active)[::-1][:top_k]
+
+            return [
+                (idx_to_label[int(active_idx[i])], float(sims_active[i]))
+                for i in order
+            ]
+
         sims = np.real(self.vectors @ np.conj(probe)) / self.dim
         top_idx = np.argsort(sims)[::-1][:top_k]
-        idx_to_label = {v: k for k, v in self._labels.items()}
-        return [(idx_to_label.get(int(i), f"#{i}"), float(sims[i])) for i in top_idx]
+
+        return [(f"#{int(i)}", float(sims[i])) for i in top_idx]
 
 
 class SemanticFHRRCodebook(FHRRCodebook):
@@ -108,10 +126,13 @@ class SemanticFHRRCodebook(FHRRCodebook):
     def _ensure_vector_capacity(self, need: int = 1) -> None:
         if self._size + need <= self._capacity:
             return
+
         new_cap = max(8, self._capacity * 2 if self._capacity else 8, self._size + need)
         nb = np.zeros((new_cap, self.dim), dtype=np.complex64)
+        
         if self._size > 0:
             nb[: self._size] = self._buf[: self._size]
+
         self._buf = nb
         self._capacity = new_cap
     
@@ -128,8 +149,8 @@ class SemanticFHRRCodebook(FHRRCodebook):
             self._proj /= np.sqrt(self._sbert_dim)
             logger.info(f"SemanticFHRR: loaded {self._sbert_model_name} "
                        f"(dim={self._sbert_dim}) → FHRR(dim={self.dim})")
-        except ImportError:
-            logger.warning("sentence-transformers not installed, falling back to random")
+        except Exception as exc:
+            logger.warning("SemanticFHRR: falling back to deterministic random vectors (%s)", exc)
             self._sbert = "FALLBACK"
             self._proj = None
     
@@ -143,39 +164,52 @@ class SemanticFHRRCodebook(FHRRCodebook):
     def register(self, label: str) -> int:
         if label in self._labels:
             return self._labels[label]
+
         self._ensure_sbert()
+
         if self._sbert == "FALLBACK" or self._proj is None:
             rng = np.random.RandomState(_stable_label_rng_seed(label))
             new_vec = np.exp(1j * rng.uniform(0, 2 * np.pi, size=self.dim)).astype(np.complex64)
         else:
             embedding = self._sbert.encode([label], show_progress_bar=False)[0]
             new_vec = self._embed_to_phasor(embedding)
+
         self._ensure_vector_capacity(1)
         self._buf[self._size] = new_vec.reshape(self.dim)
         self._labels[label] = self._size
         self._size += 1
         self.n_symbols = self._size
+
         return self._labels[label]
     
     def register_batch(self, labels: List[str]) -> List[int]:
         new_labels = [l for l in labels if l not in self._labels]
+
         if not new_labels:
             return [self._labels[l] for l in labels]
+
         self._ensure_sbert()
+
         if self._sbert == "FALLBACK" or self._proj is None:
             return [self.register(l) for l in labels]
+
         embeddings = self._sbert.encode(new_labels, show_progress_bar=False)
+        
         new_matrix = np.stack(
             [self._embed_to_phasor(embeddings[i]) for i in range(len(new_labels))],
             axis=0,
         )
+        
         self._ensure_vector_capacity(len(new_labels))
         start = self._size
+        
         for i, label in enumerate(new_labels):
             self._labels[label] = start + i
             self._buf[start + i] = new_matrix[i]
+        
         self._size += len(new_labels)
         self.n_symbols = self._size
+        
         return [self._labels[l] for l in labels]
 
 
@@ -219,6 +253,7 @@ class FHRREncoder:
         self.moduli = self._select_coprimes(n_position_moduli, position_range)
         
         self._pos_bases = []
+
         for i, m in enumerate(self.moduli):
             rng = np.random.RandomState(1000 + i)
             self._pos_bases.append(np.exp(1j * rng.uniform(0, 2*np.pi, size=dim)).astype(np.complex64))
@@ -226,6 +261,9 @@ class FHRREncoder:
         self.roles = FHRRCodebook(n_roles, dim, seed=2000)
         self.features = SemanticFHRRCodebook(dim=dim, sbert_model=sbert_model) if semantic \
             else FHRRCodebook(n_features, dim, seed=3000)
+        
+        self._position_cache: Dict[int, np.ndarray] = {}
+        self._position_cache_max = 4096
         
         for role in ["position", "value", "type", "attribute", "relation",
                      "subject", "object", "time", "channel"]:
@@ -235,17 +273,31 @@ class FHRREncoder:
         primes = [101, 103, 107, 109, 113, 127, 131, 137, 139, 149]
         selected = primes[:n]
         product = 1
+        
         for p in selected:
             product *= p
+        
         while product < min_product and len(selected) < len(primes):
             selected.append(primes[len(selected)])
             product *= selected[-1]
+        
         return selected
     
     def encode_position(self, x: int) -> np.ndarray:
+        x = int(x)
+        cached = self._position_cache.get(x)
+        
+        if cached is not None:
+            return cached.copy()
+        
         result = np.ones(self.dim, dtype=np.complex64)
+        
         for base, m in zip(self._pos_bases, self.moduli):
             result = result * (base ** (x % m))
+        
+        if len(self._position_cache) < self._position_cache_max:
+            self._position_cache[x] = result.copy()
+        
         return result
     
     def encode_value(self, value: float, precision: int = 100) -> np.ndarray:

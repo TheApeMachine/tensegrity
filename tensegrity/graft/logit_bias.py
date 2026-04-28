@@ -81,6 +81,7 @@ class TensegrityLogitsProcessor:
                  hypothesis_tokens: Dict[str, Set[int]],
                  belief_fn: Callable[[], Dict[str, float]],
                  vocab_size: int,
+                 hypothesis_token_scores: Optional[Dict[str, Dict[int, float]]] = None,
                  scale: float = 2.5,
                  suppress_threshold: float = 0.01,
                  entropy_gate: float = 0.85,
@@ -91,6 +92,8 @@ class TensegrityLogitsProcessor:
         """
         Args:
             hypothesis_tokens: {hyp_id: set of token_ids} from VocabularyGrounding
+            hypothesis_token_scores: optional semantic weights per token from
+                      VocabularyGrounding.from_semantic_projection
             belief_fn: Callable that returns current posteriors {hyp_id: probability}
                       Sync mode: called each decode step. Async mode: polled in a worker thread.
             vocab_size: LLM vocabulary size
@@ -106,6 +109,7 @@ class TensegrityLogitsProcessor:
         _ensure_torch()
         
         self.hypothesis_tokens = hypothesis_tokens
+        self.hypothesis_token_scores = hypothesis_token_scores or {}
         self.belief_fn = belief_fn
         self.vocab_size = vocab_size
         self.scale = scale
@@ -225,6 +229,7 @@ class TensegrityLogitsProcessor:
                 token_ids = self.hypothesis_tokens.get(hyp_id, set())
                 if not token_ids:
                     continue
+                token_scores = self.hypothesis_token_scores.get(hyp_id, {})
                 
                 if prob < self.suppress_threshold:
                     for tid in token_ids:
@@ -237,10 +242,11 @@ class TensegrityLogitsProcessor:
                     for tid in token_ids:
                         if 0 <= tid < self.vocab_size:
                             if not np.isneginf(bias[tid]):
-                                bias[tid] += b
-                                if b > 0:
+                                weighted_b = b * float(token_scores.get(tid, 1.0))
+                                bias[tid] += weighted_b
+                                if weighted_b > 0:
                                     boosted += 1
-                                max_mag = max(max_mag, abs(b))
+                                max_mag = max(max_mag, abs(weighted_b))
             
             max_prob = max(posteriors.values())
             confidence_scale = (
@@ -268,7 +274,6 @@ class TensegrityLogitsProcessor:
         """
         self._step_count += 1
         self.state.step = self._step_count
-        _ensure_torch()
         
         if self.async_beliefs:
             with self._bias_lock:
@@ -281,6 +286,7 @@ class TensegrityLogitsProcessor:
             self.state.bias_emitted = False
             return scores
         
+        _ensure_torch()
         bias = torch.tensor(bias_np, device=scores.device, dtype=scores.dtype)
         assert scores.shape[0] == 1, (
             f"TensegrityLogitsProcessor expects batch size 1, got {scores.shape[0]}"
@@ -298,10 +304,12 @@ class StaticLogitBiasBuilder:
     """
     
     def __init__(self, hypothesis_tokens: Dict[str, Set[int]],
+                 hypothesis_token_scores: Optional[Dict[str, Dict[int, float]]] = None,
                  scale: float = 2.5,
                  suppress_threshold: float = 0.01,
                  max_bias: float = 5.0):
         self.hypothesis_tokens = hypothesis_tokens
+        self.hypothesis_token_scores = hypothesis_token_scores or {}
         self.scale = scale
         self.suppress_threshold = suppress_threshold
         self.max_bias = max_bias
@@ -321,6 +329,7 @@ class StaticLogitBiasBuilder:
         
         for hyp_id, prob in posteriors.items():
             token_ids = self.hypothesis_tokens.get(hyp_id, set())
+            token_scores = self.hypothesis_token_scores.get(hyp_id, {})
             
             if prob < self.suppress_threshold:
                 for tid in token_ids:
@@ -329,6 +338,8 @@ class StaticLogitBiasBuilder:
                 b = self.scale * math.log(max(prob, 1e-9) / p_uniform)
                 b = max(-self.max_bias, min(self.max_bias, b))
                 for tid in token_ids:
-                    bias[tid] = bias.get(tid, 0.0) + b
+                    weighted_b = b * float(token_scores.get(tid, 1.0))
+                    bias[tid] = bias.get(tid, 0.0) + weighted_b
         
         return bias
+

@@ -16,8 +16,12 @@ The harness doesn't care where the data came from. It only sees TaskSamples.
 """
 
 from dataclasses import dataclass, field
-from typing import List, Dict, Optional, Callable, Any, Iterator
+from typing import List, Dict, Optional, Callable, Any
+import logging
 import random
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -55,11 +59,13 @@ def _adapt_arc(row: dict, task_name: str = "arc_challenge") -> TaskSample:
     choices = row["choices"]["text"]
     labels = row["choices"]["label"]
     answer = row["answerKey"]
+
     # Handle numeric answer keys ("1","2","3","4") and alpha ("A","B","C","D")
     if answer.isdigit():
         gold = int(answer) - 1
     else:
         gold = ord(answer) - ord("A")
+    
     gold = min(gold, len(choices) - 1)
 
     # Extract keywords from each choice for vocabulary grounding
@@ -388,6 +394,7 @@ def get_task(name: str) -> TaskConfig:
     if name not in TASK_REGISTRY:
         available = ", ".join(TASK_REGISTRY.keys())
         raise KeyError(f"Unknown task '{name}'. Available: {available}")
+
     return TASK_REGISTRY[name]
 
 
@@ -408,21 +415,27 @@ def load_task_samples(name: str, max_samples: Optional[int] = None) -> List[Task
     cap = max_samples or config.max_samples
 
     kwargs = {"split": config.split}
+
     if config.hf_config and config.hf_config != "default":
         ds = load_dataset(config.hf_id, config.hf_config, **kwargs)
     else:
         ds = load_dataset(config.hf_id, **kwargs)
 
     samples = []
+
     for i, row in enumerate(ds):
         if cap and i >= cap:
             break
+
         try:
             sample = config.adapter_fn(row, config.name)
+
             if not sample.id:
                 sample.id = f"{config.name}_{i}"
+
             samples.append(sample)
         except Exception as e:
+            logger.error(f"Error adapting task {name}: {e}")
             continue  # Skip malformed rows
 
     return samples

@@ -23,8 +23,6 @@ with different relation-object bindings will have low FHRR similarity
 at the binding level, even though they share surface tokens.
 """
 
-import sys
-sys.path.insert(0, '/app')
 import numpy as np
 np.random.seed(42)
 
@@ -115,8 +113,6 @@ def test_contradiction_detection():
     print(f"\n  unbind(claim_a, 'object') → '{top_label}' (sim={top_sim:.4f})")
     assert top_label == "oak_table"
     print(f"  ✓ Object filler correctly recovered via unbinding")
-    
-    return True
 
 
 def test_ngc_contradiction_signal():
@@ -172,8 +168,8 @@ def test_ngc_contradiction_signal():
     
     # Memory similarity should be high for truth, lower for lies
     print(f"\n  Memory similarity for truth: {r_truth['memory_similarity']:.4f}")
-    
-    return True
+    assert np.isfinite(mean_contra_pe)
+    assert np.isfinite(pe_truth_after)
 
 
 def test_needle_in_lies():
@@ -314,6 +310,7 @@ def test_needle_in_lies():
     
     print(f"\n  Best claim is truth: {best_is_truth}")
     print(f"  Truth in top 3: {truth_in_top_3}")
+    assert truth_in_top_3, "At least one repeated truth should rank in the top 3"
     
     # Compute mean score for truth vs lies
     truth_scores = [s['score'] for s in scores if s['is_truth']]
@@ -331,7 +328,6 @@ def test_needle_in_lies():
     else:
         print(f"  ✗ Lies score higher — NGC hasn't separated them yet")
     
-    return truth_in_top_3
 
 
 def main():
@@ -366,3 +362,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+

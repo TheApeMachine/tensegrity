@@ -93,6 +93,7 @@ class EpisodicMemory:
         
         # Surprise-sorted index (for retrieving most surprising episodes)
         self._surprise_heap: List[Tuple[float, int]] = []  # (neg_surprise, idx)
+        self._projection_cache: Dict[Tuple[int, int], Tuple[np.ndarray, np.ndarray]] = {}
         
         self._timestep = 0
     
@@ -103,6 +104,7 @@ class EpisodicMemory:
         self.episodes.clear()
         self._morton_index.clear()
         self._surprise_heap.clear()
+        self._projection_cache.clear()
         self._timestep = 0
     
     def _compute_item_representation(self, observation: np.ndarray,
@@ -121,9 +123,15 @@ class EpisodicMemory:
         obs_flat = observation.flatten()
         bel_flat = belief_state.flatten()
         
-        # Random projection to context_dim
-        W_obs = rng_obs.randn(self.context_dim, len(obs_flat)) / np.sqrt(len(obs_flat))
-        W_bel = rng_bel.randn(self.context_dim, len(bel_flat)) / np.sqrt(len(bel_flat))
+        # Random projection to context_dim.  Cache by input shape so repeated
+        # agent steps do not rebuild the same Johnson-Lindenstrauss matrices.
+        key = (len(obs_flat), len(bel_flat))
+        if key not in self._projection_cache:
+            W_obs = rng_obs.randn(self.context_dim, len(obs_flat)) / np.sqrt(max(len(obs_flat), 1))
+            W_bel = rng_bel.randn(self.context_dim, len(bel_flat)) / np.sqrt(max(len(bel_flat), 1))
+            self._projection_cache[key] = (W_obs, W_bel)
+        else:
+            W_obs, W_bel = self._projection_cache[key]
         
         item_rep = W_obs @ obs_flat + W_bel @ bel_flat
         norm = np.linalg.norm(item_rep)
@@ -353,3 +361,6 @@ class EpisodicMemory:
             'zipf_exponent': self.zipf_s,
             'context_drift': self.drift_rate,
         }
+
+
+

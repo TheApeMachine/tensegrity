@@ -48,18 +48,25 @@ def truncate_to_sentence(text: str, max_len: int = _CAUSAL_SUMMARY_MAX_CHARS) ->
     """
     if len(text) <= max_len:
         return text, False
+
     chunk = text[:max_len]
     last_break_end = -1
     i = 0
+
     while i < len(chunk):
         if chunk[i] in ".?!" and (i + 1 == len(chunk) or chunk[i + 1].isspace()):
             last_break_end = i + 1
+
         i += 1
+
     if last_break_end > 0:
         return chunk[:last_break_end].rstrip(), True
+
     cut = chunk.rfind(" ")
+
     if cut > max_len // 2:
         return chunk[:cut].rstrip(), True
+
     return chunk, True
 
 
@@ -100,6 +107,7 @@ class BrocaInterface:
         self.max_produce_tokens = max_produce_tokens
         
         api_key = api_key or os.environ.get("HF_TOKEN")
+
         if not api_key:
             raise ValueError("HF_TOKEN environment variable or api_key required")
         
@@ -135,6 +143,7 @@ class BrocaInterface:
             if result is None:
                 # Fallback: try manual parse from content
                 content = completion.choices[0].message.content
+
                 if content:
                     result = schema.model_validate_json(content)
                 else:
@@ -169,6 +178,7 @@ class BrocaInterface:
             "Do NOT output prose reasoning — only typed fields. "
             "If something is unclear, set confidence_linguistic lower."
         )
+
         if context:
             system_prompt += f"\n\nContext: {context}"
         
@@ -178,6 +188,7 @@ class BrocaInterface:
         ]
         
         self._parse_calls += 1
+
         return self._call_llm(messages, ParsedObservation, self.max_parse_tokens)
     
     def propose_causal_hypothesis(
@@ -198,6 +209,7 @@ class BrocaInterface:
         )
         existing = ", ".join(existing_model_names[:24]) if existing_model_names else "(none)"
         summary, did_truncate = truncate_to_sentence(situation_summary, _CAUSAL_SUMMARY_MAX_CHARS)
+
         if did_truncate:
             logger.warning(
                 "situation_summary truncated for causal hypothesis prompt: "
@@ -205,22 +217,27 @@ class BrocaInterface:
                 len(situation_summary),
                 _CAUSAL_SUMMARY_MAX_CHARS,
             )
+
         user_content = (
             f"Existing models: {existing}\n\n"
             f"Observations / situation:\n{summary}"
         )
+
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_content},
         ]
+
         self._hypothesis_calls += 1
         proposed = self._call_llm(messages, ProposedSCM, self.max_parse_tokens)
         existing_lower = {n.casefold(): n for n in existing_model_names}
+
         if proposed.name.casefold() in existing_lower:
             raise DuplicateModelNameError(
                 f"LLM proposed duplicate SCM name {proposed.name!r}; existing names included "
                 f"{existing_lower[proposed.name.casefold()]!r}. Update prompts or regenerate."
             )
+
         return proposed
     
     def parse_feedback(self, feedback: str, 
@@ -249,6 +266,7 @@ class BrocaInterface:
         ]
         
         self._parse_calls += 1
+
         return self._call_llm(messages, ParsedFeedback, self.max_parse_tokens)
     
     def produce(self, action: CognitiveAction, 

@@ -1,8 +1,6 @@
 """
 Integration tests: ScoringBridge on benchmark samples and energy causal arena.
 """
-import sys
-sys.path.insert(0, '/app')
 import numpy as np
 np.random.seed(42)
 
@@ -42,7 +40,6 @@ def test_scoring_bridge_on_tasks():
         print(f"\n  {task_name}: {correct}/{total} = {acc:.1%}")
     
     print(f"\n  ✓ ScoringBridge functional")
-    return True
 
 
 def test_causal_energy_arena():
@@ -90,7 +87,6 @@ def test_causal_energy_arena():
     print(f"  Last posteriors: {last_result['posteriors']}")
     
     print(f"  ✓ Energy causal arena functional")
-    return True
 
 
 if __name__ == "__main__":
@@ -111,3 +107,5 @@ if __name__ == "__main__":
             import traceback; traceback.print_exc()
     
     print()
+
+

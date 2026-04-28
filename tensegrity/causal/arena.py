@@ -22,7 +22,7 @@ This is the Expected Free Energy's epistemic component driving exploration.
 """
 
 import numpy as np
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, List, Optional, Any
 from collections import defaultdict
 import logging
 
@@ -46,9 +46,11 @@ class CausalArena:
     competing explanations until one dominates.
     """
     
-    def __init__(self, prior_concentration: float = 1.0,
-                 falsification_threshold: float = -50.0,
-                 min_models: int = 2):
+    def __init__(
+        self, prior_concentration: float = 1.0,
+        falsification_threshold: float = -50.0,
+        min_models: int = 2,
+    ):
         """
         Args:
             prior_concentration: Dirichlet prior over model space (uniform = 1.0)
@@ -78,6 +80,7 @@ class CausalArena:
         self.model_log_evidence[model.name] = 0.0
         self.model_prior[model.name] = prior_weight or self.prior_concentration
         self.evidence_trajectories[model.name] = [0.0]
+        
         logger.info(f"Registered model '{model.name}' in arena")
     
     def compete(self, observation: Dict[str, int]) -> Dict[str, Any]:
@@ -92,6 +95,7 @@ class CausalArena:
         
         # Each model computes log P(observation | model)
         log_likelihoods = {}
+        
         for name, model in self.models.items():
             log_lik = model.log_evidence([observation])
             log_likelihoods[name] = log_lik
@@ -141,18 +145,22 @@ class CausalArena:
         In log space: log P(M_k | data) = log_evidence_k + log_prior_k - log Z
         """
         log_posteriors = {}
+        
         for name in self.models:
-            log_posteriors[name] = (self.model_log_evidence[name] + 
-                                   np.log(max(self.model_prior[name], 1e-16)))
+            log_posteriors[name] = self.model_log_evidence[name] + np.log(
+                max(self.model_prior[name], 1e-16)
+            )
         
         # Normalize via log-sum-exp
         max_log = max(log_posteriors.values())
+        
         log_Z = max_log + np.log(sum(
             np.exp(lp - max_log) for lp in log_posteriors.values()
         ))
         
         posterior = {name: np.exp(lp - log_Z) 
                     for name, lp in log_posteriors.items()}
+        
         return posterior
     
     def _compute_tension(self, posterior: Dict[str, float]) -> float:
@@ -171,6 +179,7 @@ class CausalArena:
         
         if max_entropy == 0:
             return 0.0
+        
         return float(entropy / max_entropy)
     
     def _falsify(self) -> List[str]:
@@ -206,7 +215,8 @@ class CausalArena:
         
         return to_eliminate
     
-    def suggest_experiment(self) -> Dict[str, Any]:
+    def suggest_experiment(self, n_samples: int = 32,
+                           n_outcome_samples: int = 8) -> Dict[str, Any]:
         """
         Suggest an intervention that would maximally reduce tension.
         
@@ -224,6 +234,7 @@ class CausalArena:
         
         # Get all variables across models
         all_vars = set()
+        
         for model in self.models.values():
             all_vars.update(model.variables)
         
@@ -233,13 +244,19 @@ class CausalArena:
         for var in all_vars:
             # For each possible intervention value
             n_values = 4  # Default cardinality
+        
             for model in self.models.values():
                 if var in model.mechanisms:
                     n_values = model.mechanisms[var].n_values
                     break
             
             for val in range(n_values):
-                info_gain = self._estimate_info_gain(var, val)
+                info_gain = self._estimate_info_gain(
+                    var, val,
+                    n_samples=n_samples,
+                    n_outcome_samples=n_outcome_samples,
+                )
+        
                 if info_gain > best_info_gain:
                     best_info_gain = info_gain
                     best_experiment = {'variable': var, 'value': val}
@@ -250,7 +267,8 @@ class CausalArena:
             'current_tension': self.tension_history[-1] if self.tension_history else 1.0,
         }
     
-    def _estimate_info_gain(self, var: str, val: int, n_samples: int = 100) -> float:
+    def _estimate_info_gain(self, var: str, val: int, n_samples: int = 32,
+                            n_outcome_samples: int = 8) -> float:
         """
         Estimate information gain from do(var=val).
         
@@ -261,6 +279,7 @@ class CausalArena:
         
         # For each model, predict what we'd observe after intervention
         predicted_outcomes = {}
+        
         for name, model in self.models.items():
             if var not in model.graph:
                 continue
@@ -275,7 +294,7 @@ class CausalArena:
         # Estimate expected posterior entropy after seeing outcomes
         # Use model-averaged predictions
         expected_tension = 0.0
-        n_outcome_samples = min(n_samples, 20)
+        n_outcome_samples = min(n_samples, max(1, int(n_outcome_samples)))
         
         for name, outcomes in predicted_outcomes.items():
             model_weight = current_posterior.get(name, 1.0 / len(self.models))
@@ -283,15 +302,19 @@ class CausalArena:
             for outcome in outcomes[:n_outcome_samples]:
                 # What would the posterior look like if we saw this outcome?
                 hypothetical_log_liks = {}
+        
                 for m_name, model in self.models.items():
                     hypothetical_log_liks[m_name] = model.log_evidence([outcome])
                 
                 # Hypothetical posterior
                 hyp_evidence = {m: self.model_log_evidence[m] + hypothetical_log_liks[m]
                                for m in self.models}
+        
                 max_e = max(hyp_evidence.values())
+        
                 log_Z = max_e + np.log(sum(
                     np.exp(e - max_e) for e in hyp_evidence.values()))
+        
                 hyp_posterior = {m: np.exp(e - log_Z) for m, e in hyp_evidence.items()}
                 
                 expected_tension += model_weight * self._compute_tension(hyp_posterior)
@@ -329,9 +352,12 @@ class CausalArena:
             'outcome': observed_outcome,
         }
     
-    def counterfactual_comparison(self, evidence: Dict[str, int],
-                                  intervention: Dict[str, int],
-                                  query: List[str]) -> Dict[str, Dict[str, np.ndarray]]:
+    def counterfactual_comparison(
+        self, 
+        evidence: Dict[str, int],
+        intervention: Dict[str, int],
+        query: List[str],
+    ) -> Dict[str, Dict[str, np.ndarray]]:
         """
         Ask each model: "What would have happened if we had done X instead?"
         
@@ -356,6 +382,7 @@ class CausalArena:
         """The model with highest current posterior probability."""
         if not self.models:
             return None
+        
         posterior = self._compute_posterior()
         return max(posterior, key=posterior.get)
     
@@ -364,6 +391,7 @@ class CausalArena:
         """Current tension level (0=resolved, 1=maximum uncertainty)."""
         if not self.models:
             return 0.0
+        
         posterior = self._compute_posterior()
         return self._compute_tension(posterior)
     

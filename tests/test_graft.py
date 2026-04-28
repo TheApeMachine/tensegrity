@@ -8,8 +8,6 @@ Tests:
   4. Full pipeline on the benchmark scenarios
 """
 
-import sys
-sys.path.insert(0, '/app')
 import numpy as np
 import json
 
@@ -54,8 +52,6 @@ def test_offline_pipeline():
     print(f"  Output: \"{result['generation']['text']}\"")
     assert winner == "parrot", f"Expected 'parrot', got '{winner}'"
     print(f"  ✓ Correct answer identified via pure cognitive resolution")
-    
-    return True
 
 
 def test_logit_bias_computation():
@@ -110,8 +106,6 @@ def test_logit_bias_computation():
     print(f"\n  Uniform posteriors: max |bias| = {max_bias:.4f}")
     assert max_bias < 0.1, "Uniform posteriors should produce near-zero biases"
     print(f"  ✓ Uniform beliefs → near-zero biases (no information to inject)")
-    
-    return True
 
 
 def test_convergence_gating():
@@ -178,8 +172,6 @@ def test_convergence_gating():
     print(f"  Cat token 200 change:   {cat_change:+.4f}")
     assert parrot_boost > 0, "Winning hypothesis tokens should be boosted"
     print(f"  ✓ Resolved beliefs → biases emitted, winner boosted")
-    
-    return True
 
 
 def test_rca_pipeline():
@@ -238,8 +230,6 @@ def test_rca_pipeline():
     assert ml_prob_final < ml_prob_after_misleading, "Should recover from misleading evidence"
     print(f"  ✓ Recovered from misleading evidence via Bayesian updating")
     print(f"  ✓ Correct root cause identified: {winner}")
-    
-    return True
 
 
 def main():
@@ -279,3 +269,5 @@ def main():
 if __name__ == "__main__":
     ok = main()
     sys.exit(0 if ok else 1)
+
+

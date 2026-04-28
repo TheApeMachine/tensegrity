@@ -15,7 +15,7 @@ CRITICAL DESIGN RULE:
   - If the LLM can express an opinion in a field, that field shouldn't exist.
 """
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from typing import List, Optional, Literal
 from enum import Enum
 
@@ -75,9 +75,11 @@ class ProposedSCM(BaseModel):
         adj: defaultdict[str, list[str]] = defaultdict(list)
         indegree: defaultdict[str, int] = defaultdict(int)
         nodes: set[str] = set()
+
         for s, t in edges:
             if not s or not t:
                 continue
+        
             nodes.add(s)
             nodes.add(t)
             adj[s].append(t)
@@ -85,15 +87,20 @@ class ProposedSCM(BaseModel):
 
         q: deque[str] = deque([n for n in nodes if indegree.get(n, 0) == 0])
         visited_count = 0
+        
         while q:
             u = q.popleft()
             visited_count += 1
+        
             for v in adj[u]:
                 indegree[v] -= 1
+        
                 if indegree[v] == 0:
                     q.append(v)
+        
         if edges and visited_count != len(nodes):
             raise ValueError("ProposedSCM.edges must form a DAG; a cycle was detected.")
+        
         return self
 
 
@@ -105,6 +112,7 @@ class ParsedObservation(BaseModel):
     """
     entities: List[EntityMention] = Field(default_factory=list)
     relations: List[RelationMention] = Field(default_factory=list)
+
     implicit_relations: List[RelationMention] = Field(
         default_factory=list,
         max_length=48,
@@ -113,11 +121,13 @@ class ParsedObservation(BaseModel):
             "use closed predicates only (same vocabulary as relations)."
         ),
     )
+
     is_question: bool = Field(description="Is the input asking for information?")
     is_assertion: bool = Field(description="Is the input stating a fact/claim?")
     is_command: bool = Field(description="Is the input requesting an action?")
     negation_present: bool = Field(description="Does the input contain negation?")
     temporal_marker: Optional[Literal["past", "present", "future", "hypothetical"]] = None
+    
     confidence_linguistic: float = Field(
         ge=0.0, le=1.0, 
         description="How clear/unambiguous is the input? 1.0 = perfectly clear"
@@ -131,16 +141,20 @@ class ParsedFeedback(BaseModel):
     The LLM classifies the feedback. Tensegrity updates beliefs.
     """
     outcome: Literal["success", "failure", "partial", "ambiguous", "no_feedback"]
+    
     confirms_hypothesis: Optional[str] = Field(
         default=None, description="Which hypothesis (if any) this feedback supports"
     )
+    
     contradicts_hypothesis: Optional[str] = Field(
         default=None, description="Which hypothesis (if any) this feedback contradicts"
     )
+    
     new_information: List[str] = Field(
         default_factory=list, 
         description="Facts revealed by this feedback that weren't known before"
     )
+    
     surprise_linguistic: float = Field(
         ge=0.0, le=1.0,
         description="How unexpected is this feedback given the context? 1.0 = very surprising"
@@ -157,8 +171,13 @@ class Utterance(BaseModel):
     
     Tensegrity decides WHAT to communicate. The LLM decides HOW to say it.
     """
+    model_config = ConfigDict(populate_by_name=True)
+
     text: str = Field(description="The natural language output")
-    register: Literal["formal", "casual", "technical", "empathetic"] = "casual"
+    style_register: Literal["formal", "casual", "technical", "empathetic"] = Field(
+        default="casual",
+        alias="register",
+    )
 
 
 class QuestionUtterance(BaseModel):
@@ -192,20 +211,25 @@ class BeliefState(BaseModel):
     """
     turn: int = 0
     hypotheses: List[Hypothesis] = Field(default_factory=list)
+
     eliminated_hypotheses: List[str] = Field(
         default_factory=list, 
         description="Hypotheses that have been falsified — LLM must not re-introduce"
     )
+    
     confirmed_facts: List[str] = Field(default_factory=list)
     open_questions: List[str] = Field(default_factory=list)
+    
     current_tension: float = Field(
         ge=0.0, le=1.0, 
         description="Entropy of posterior over competing models"
     )
+    
     epistemic_urgency: float = Field(
         ge=0.0, le=1.0,
         description="How much the agent needs to gather information vs act"
     )
+    
     free_energy: float = 0.0
 
 

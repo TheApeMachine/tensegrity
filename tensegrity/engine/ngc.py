@@ -488,3 +488,6 @@ class PredictiveCodingCircuit:
             "energy_history_len": len(self.energy_history),
             "last_error_norms": self.error_history[-1] if self.error_history else [],
         }
+
+
+

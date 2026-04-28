@@ -360,3 +360,6 @@ class FreeEnergyEngine:
             'belief_entropy': self.epistemic_value,
             'steps': len(self.F_history),
         }
+
+
+

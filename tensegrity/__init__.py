@@ -1,59 +1,103 @@
 """
-Tensegrity: A Non-Gradient Cognitive Architecture
+Tensegrity: a non-gradient cognitive architecture centered on a unified
+energy landscape.
 
-Built on:
-  - Friston's Free Energy Principle (variational free energy minimization via belief propagation)
-  - Pearl's Causal Calculus (structural causal models, do-calculus, counterfactuals)
-  - Markov blankets as computational boundaries
-  - Bayesian belief updating (no backpropagation)
-  - Zipf-distributed memory access (power-law priority)
-  - Morton-coded modality-agnostic sensory input
+The primary engine is now the V2 ``UnifiedField`` stack:
 
-The "tension" in this system comes from competing causal models that each try to explain
-observations. Resolution is through Bayesian model comparison — the model that minimizes
-variational free energy (maximizes evidence) wins each cycle. No gradient descent anywhere.
+    FHRR encoding -> hierarchical predictive coding -> Hopfield memory
+    -> optional causal energy terms
 
-Architecture:
-  ┌─────────────────────────────────────────────────────────┐
-  │                    MARKOV BLANKET                        │
-  │  ┌──────────┐                          ┌──────────┐    │
-  │  │ SENSORY  │  Morton-coded input       │  ACTIVE  │    │
-  │  │  STATES  │ ─────────────────────┐    │  STATES  │    │
-  │  └──────────┘                      │    └────┬─────┘    │
-  │       │                            │         │          │
-  │       ▼                            │         │          │
-  │  ┌──────────────────────────┐      │         │          │
-  │  │     BELIEF STATES        │      │         │          │
-  │  │  Q(s) over hidden states │◄─────┘         │          │
-  │  │  Updated via VFE min     │                │          │
-  │  └─────────┬────────────────┘                │          │
-  │            │                                 │          │
-  │            ▼                                 │          │
-  │  ┌──────────────────────────┐                │          │
-  │  │   CAUSAL ARENA           │                │          │
-  │  │  M₁ vs M₂ vs ... vs Mₖ  │────────────────┘          │
-  │  │  SCMs compete via F      │                           │
-  │  └─────────┬────────────────┘                           │
-  │            │                                            │
-  │            ▼                                            │
-  │  ┌──────────────────────────────────────┐               │
-  │  │         MEMORY SYSTEMS               │               │
-  │  │  Epistemic │ Episodic │ Associative  │               │
-  │  │  (beliefs) │ (traces) │ (Hopfield)   │               │
-  │  │  Zipf-weighted access priority       │               │
-  │  └──────────────────────────────────────┘               │
-  └─────────────────────────────────────────────────────────┘
+Legacy V1 components remain importable from ``tensegrity.legacy.v1``:
+
+    from tensegrity.legacy.v1 import TensegrityAgent, MortonEncoder
+
+Top-level exports intentionally expose the unified field as the default
+architecture. Deprecated V1 names are resolved lazily for migration only.
 """
+
+from importlib import import_module
+from typing import Any
+import warnings
+
+from tensegrity.engine import (
+    UnifiedField,
+    HopfieldMemoryBank,
+    EnergyDecomposition,
+    PredictiveCodingCircuit,
+    LayerState,
+    FHRREncoder,
+    FHRRCodebook,
+    SemanticFHRRCodebook,
+    bind,
+    bundle,
+    unbind,
+    permute,
+    EnergyCausalArena,
+    CausalEnergyTerm,
+    TopologyMapper,
+    TopologyMapping,
+    VirtualParent,
+    ScoringBridge,
+    NGCLogitsProcessor,
+)
 
 __version__ = "0.1.0"
 
-from tensegrity.core.agent import TensegrityAgent
-from tensegrity.core.morton import MortonEncoder
-from tensegrity.core.blanket import MarkovBlanket
-from tensegrity.memory.epistemic import EpistemicMemory
-from tensegrity.memory.episodic import EpisodicMemory
-from tensegrity.memory.associative import AssociativeMemory
-from tensegrity.causal.arena import CausalArena
-from tensegrity.causal.scm import StructuralCausalModel
-from tensegrity.inference.free_energy import FreeEnergyEngine
-from tensegrity.inference.belief_propagation import BeliefPropagator
+__all__ = (
+    "__version__",
+    "UnifiedField",
+    "HopfieldMemoryBank",
+    "EnergyDecomposition",
+    "PredictiveCodingCircuit",
+    "LayerState",
+    "FHRREncoder",
+    "FHRRCodebook",
+    "SemanticFHRRCodebook",
+    "bind",
+    "bundle",
+    "unbind",
+    "permute",
+    "EnergyCausalArena",
+    "CausalEnergyTerm",
+    "TopologyMapper",
+    "TopologyMapping",
+    "VirtualParent",
+    "ScoringBridge",
+    "NGCLogitsProcessor",
+)
+
+_LEGACY_EXPORTS = {
+    "TensegrityAgent": ("tensegrity.legacy.v1.agent", "TensegrityAgent"),
+    "MortonEncoder": ("tensegrity.legacy.v1.morton", "MortonEncoder"),
+    "MarkovBlanket": ("tensegrity.legacy.v1.blanket", "MarkovBlanket"),
+    "EpistemicMemory": ("tensegrity.memory.epistemic", "EpistemicMemory"),
+    "EpisodicMemory": ("tensegrity.memory.episodic", "EpisodicMemory"),
+    "AssociativeMemory": ("tensegrity.memory.associative", "AssociativeMemory"),
+    "CausalArena": ("tensegrity.causal.arena", "CausalArena"),
+    "StructuralCausalModel": ("tensegrity.causal.scm", "StructuralCausalModel"),
+    "FreeEnergyEngine": ("tensegrity.inference.free_energy", "FreeEnergyEngine"),
+    "BeliefPropagator": ("tensegrity.inference.belief_propagation", "BeliefPropagator"),
+}
+
+
+def __getattr__(name: str) -> Any:
+    """Resolve deprecated top-level V1 names with an explicit migration warning."""
+    target = _LEGACY_EXPORTS.get(name)
+
+    if target is None:
+        raise AttributeError(f"module 'tensegrity' has no attribute {name!r}")
+
+    module_name, attr = target
+    
+    warnings.warn(
+        f"tensegrity.{name} is not part of the primary V2 export surface. "
+        f"Import {name} from {module_name} explicitly, or use "
+        "tensegrity.UnifiedField for the unified energy engine.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    
+    value = getattr(import_module(module_name), attr)
+    globals()[name] = value
+    
+    return value

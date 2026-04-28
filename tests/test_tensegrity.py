@@ -10,8 +10,6 @@ Tests:
   6. Full agent loop (perceive → plan → act → learn)
 """
 
-import sys
-sys.path.insert(0, '/app')
 import numpy as np
 import traceback
 np.random.seed(42)
@@ -23,7 +21,7 @@ def test_morton_encoding():
     print("TEST 1: Morton Encoding (Modality-Agnostic Sensory Frontend)")
     print("=" * 60)
     
-    from tensegrity.core.morton import MortonEncoder
+    from tensegrity.legacy.v1.morton import MortonEncoder
     
     # 2D encoder (like an image patch: x, y)
     enc = MortonEncoder(n_dims=2, bits_per_dim=8, 
@@ -62,8 +60,6 @@ def test_morton_encoding():
     print(f"\n  Audio encoder: {audio_enc.n_dims}D, {audio_enc.bits_per_dim} bits/dim")
     print(f"  Text encoder:  {text_enc.n_dims}D, {text_enc.bits_per_dim} bits/dim")
     print(f"  Both produce integer codes — modality agnostic ✓")
-    
-    return True
 
 
 def test_free_energy_engine():
@@ -124,10 +120,9 @@ def test_free_energy_engine():
     F_end = np.mean(F_values[-5:])
     print(f"\n  Mean F (first 5): {F_start:.3f}")
     print(f"  Mean F (last 5):  {F_end:.3f}")
+    assert np.all(np.isfinite(F_values))
     print(f"  ✓ Free energy minimized via fixed-point iteration (no gradients)")
     print(f"  ✓ Belief converged to correct state: {np.argmax(engine.q_states)}")
-    
-    return True
 
 
 def test_belief_propagation():
@@ -174,8 +169,6 @@ def test_belief_propagation():
         "Evidence should shift posterior"
     print(f"  ✓ Evidence propagated correctly (A posterior shifted toward 1)")
     print(f"  ✓ Bethe free energy: {bp.free_energy():.4f}")
-    
-    return True
 
 
 def test_memory_systems():
@@ -258,10 +251,9 @@ def test_memory_systems():
     # Soft retrieval (Boltzmann distribution)
     blended, weights = am.retrieve_soft(noisy)
     print(f"  Soft retrieval weights (top 3): {sorted(weights)[-3:]}")
+    assert best_match == 3
     print(f"  ✓ Content-addressed retrieval via energy minimization")
     print(f"  Stats: {am.statistics}")
-    
-    return True
 
 
 def test_causal_arena():
@@ -346,9 +338,8 @@ def test_causal_arena():
     experiment = arena.suggest_experiment()
     print(f"  Suggested experiment: {experiment['intervention']}")
     print(f"  Expected info gain: {experiment['expected_info_gain']:.4f}")
+    assert final["current_winner"] in final["posterior"]
     print(f"  ✓ Active inference drives epistemic exploration")
-    
-    return True
 
 
 def test_full_agent():
@@ -357,7 +348,7 @@ def test_full_agent():
     print("TEST 6: Full Agent Loop (Perceive → Plan → Act → Learn)")
     print("=" * 60)
     
-    from tensegrity.core.agent import TensegrityAgent
+    from tensegrity.legacy.v1.agent import TensegrityAgent
     
     agent = TensegrityAgent(
         n_states=8,
@@ -434,8 +425,6 @@ def test_full_agent():
         print(f"  Tension trajectory (last 5): {[f'{t:.3f}' for t in tension_traj[-5:]]}")
     
     print(f"\n  ✓ Full agent loop running — zero gradient descent, zero backpropagation")
-    
-    return True
 
 
 def main():

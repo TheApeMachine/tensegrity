@@ -431,3 +431,6 @@ class BeliefPropagator:
             bp.add_factor(f"f_{var}", factor_vars, cpd)
         
         return bp
+
+
+

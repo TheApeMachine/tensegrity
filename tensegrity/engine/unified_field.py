@@ -110,8 +110,11 @@ class HopfieldMemoryBank:
         
         # Energy
         sims = self._matrix.T @ xi
-        log_sum_exp = np.log(np.sum(np.exp(self.beta * sims - self.beta * sims.max()))) + self.beta * sims.max()
-        energy = float(-log_sum_exp / self.beta + 0.5 * np.dot(xi, xi))
+        if self.beta <= 1e-12:
+            energy = float(0.5 * np.dot(xi, xi) - np.mean(sims))
+        else:
+            log_sum_exp = np.log(np.sum(np.exp(self.beta * sims - self.beta * sims.max()))) + self.beta * sims.max()
+            energy = float(-log_sum_exp / self.beta + 0.5 * np.dot(xi, xi))
         
         return xi, energy
     
@@ -282,7 +285,9 @@ class UnifiedField:
             causal=0.0,  # Will be added when causal module is connected
             total=perception_energy + memory_energy,
             prediction_error_norm=float(prediction_error_post_settle),
-            surprise=float(np.log(max(prediction_error_post_settle, 1e-16))),
+            # Monotone prediction-error proxy.  ``log1p`` keeps surprise
+            # non-negative even when the squared prediction error is below 1.0.
+            surprise=float(np.log1p(max(prediction_error_post_settle, 0.0))),
         )
         self.energy_history.append(decomp)
         
@@ -325,3 +330,6 @@ class UnifiedField:
             "fhrr_dim": self.fhrr_dim,
             "obs_dim": self.obs_dim,
         }
+
+
+

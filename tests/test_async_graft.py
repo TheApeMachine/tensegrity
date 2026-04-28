@@ -122,9 +122,76 @@ def test_build_scm_from_proposal():
     assert "x" in scm.variables and "z" in scm.variables
 
 
+def test_scm_marginalizes_missing_parents_and_counterfactual_changes_descendants():
+    from tensegrity.causal.scm import StructuralCausalModel
+
+    scm = StructuralCausalModel("two_node")
+    scm.add_variable("X", n_values=2)
+    scm.add_variable("Y", n_values=2, parents=["X"])
+    scm.mechanisms["X"].cpt_params = np.array([[100.0], [1.0]])
+    scm.mechanisms["Y"].cpt_params = np.array([
+        [100.0, 1.0],
+        [1.0, 100.0],
+    ])
+
+    p_x0 = 100.0 / 101.0
+    p_x1 = 1.0 / 101.0
+    expected_p_y1 = p_x0 * (1.0 / 101.0) + p_x1 * (100.0 / 101.0)
+    assert np.isclose(
+        scm.observe({"Y": 1})["log_likelihood"],
+        np.log(expected_p_y1),
+    )
+
+    cf = scm.counterfactual({"X": 0, "Y": 0}, {"X": 1}, ["Y"])
+    assert cf["Y"][1] > 0.98
+    assert cf["Y"][0] < 0.02
+
+
+def test_eliminated_hypothesis_stays_eliminated_after_engine_blend():
+    from tensegrity.broca.controller import CognitiveController
+
+    controller = CognitiveController(
+        n_hypotheses=2,
+        hypothesis_labels=["a", "b"],
+        use_llm=False,
+    )
+    controller.belief_state.hypotheses[0].probability = 0.0
+    controller.belief_state.hypotheses[1].probability = 1.0
+    controller.belief_state.eliminated_hypotheses = ["H0"]
+
+    controller._update_hypotheses_from_inference(
+        {
+            "belief_state": np.array([1.0, 0.0]),
+            "arena": {"tension": 0.5},
+            "free_energy": 0.0,
+        },
+        np.array([0.0, 0.0]),
+    )
+
+    assert controller.belief_state.hypotheses[0].probability == 0.0
+    assert controller.belief_state.hypotheses[1].probability == 1.0
+    assert controller.belief_state.eliminated_hypotheses == ["H0"]
+
+
+def test_canonical_soft_reset_preserves_ngc_weights():
+    from tensegrity.pipeline.canonical import CanonicalPipeline
+
+    pipeline = CanonicalPipeline(["a", "b"])
+    before = [w.copy() for w in pipeline.controller.agent.field.ngc.W]
+    pipeline._soft_reset_in_place(["a", "b"])
+
+    for old, new in zip(before, pipeline.controller.agent.field.ngc.W):
+        assert np.allclose(old, new)
+
+
 if __name__ == "__main__":
     test_ngc_warm_start_fewer_steps()
     test_async_beliefs_processor_matches_sync()
     test_associative_access_decay()
     test_build_scm_from_proposal()
+    test_scm_marginalizes_missing_parents_and_counterfactual_changes_descendants()
+    test_eliminated_hypothesis_stays_eliminated_after_engine_blend()
+    test_canonical_soft_reset_preserves_ngc_weights()
     print("ok")
+
+

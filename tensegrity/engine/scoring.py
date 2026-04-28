@@ -271,6 +271,8 @@ class ScoringBridge:
     
     def _sentence_similarities(self, prompt, choices):
         features = self.field.encoder.features
+        if hasattr(features, '_ensure_sbert') and getattr(features, '_sbert', None) is None:
+            features._ensure_sbert()
         if hasattr(features, '_sbert') and features._sbert is not None and features._sbert != "FALLBACK":
             features._ensure_sbert()
             embs = features._sbert.encode([prompt] + choices, show_progress_bar=False)
@@ -299,3 +301,6 @@ class ScoringBridge:
     def statistics(self):
         return {"total_scored": self._total_scored, "total_gated": self._total_gated,
                 "gate_rate": self._total_gated / max(self._total_scored, 1)}
+
+
+

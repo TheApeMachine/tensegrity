@@ -250,6 +250,8 @@ class AssociativeMemory:
         """
         self._ensure_matrix()
         similarities = self._pattern_matrix.T @ xi
+        if self.beta <= 1e-12:
+            return float(0.5 * np.dot(xi, xi) - np.mean(similarities))
         log_sum_exp = np.log(np.sum(np.exp(self.beta * similarities - 
                                             self.beta * similarities.max()))) + \
                       self.beta * similarities.max()
@@ -269,11 +271,14 @@ class AssociativeMemory:
         This creates a self-reinforcing power law: popular patterns
         become more accessible, rare patterns fade.
         """
-        counts = np.maximum(self._access_counts, 0.0) + 1.0
-        # Rank by access count (descending)
-        ranks = np.argsort(np.argsort(-counts)) + 1  # 1-indexed ranks
-        # Zipf weight: 1/rank^s
-        weights = 1.0 / (ranks ** self.zipf_s)
+        counts = np.maximum(np.asarray(self._access_counts, dtype=np.float64), 0.0) + 1.0
+        if counts.size == 0:
+            return counts
+
+        # Equal access counts should not create an arbitrary preference for
+        # earlier stored patterns. Use frequency weighting with a +1 prior; the
+        # first retrieval from a fresh memory is therefore content-addressed.
+        weights = counts ** self.zipf_s
         return weights / weights.sum()
     
     def _ensure_matrix(self):
@@ -320,3 +325,5 @@ class AssociativeMemory:
             'beta': self.beta,
             'dimension': self.dim,
         }
+
+

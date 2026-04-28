@@ -17,18 +17,15 @@ The controller ALWAYS makes the decision, then asks the LLM to verbalize it.
 """
 
 import numpy as np
-from typing import Optional, Dict, List, Any, Tuple
-from dataclasses import dataclass, field
+from typing import Optional, Dict, List, Any
 import logging
-import json
 import re
 from difflib import SequenceMatcher
 
-from tensegrity.core.agent import TensegrityAgent, DEFAULT_MEDIATED_SCM_NAME
+from tensegrity.legacy.v1.agent import TensegrityAgent, DEFAULT_MEDIATED_SCM_NAME
 from tensegrity.broca.schemas import (
     ParsedObservation,
     ParsedFeedback,
-    Utterance,
     BeliefState,
     CognitiveAction,
     Hypothesis,
@@ -51,19 +48,27 @@ def _relation_term_matches_hypothesis(term: str, label: str) -> bool:
     """Stricter than substring overlap: tokens, regex word boundaries, or high string similarity."""
     term = term.strip().lower()
     label = label.strip().lower()
+
     if not term or not label:
         return False
+    
     if term == label:
         return True
+    
     if re.search(r"\b" + re.escape(term) + r"\b", label):
         return True
+    
     if re.search(r"\b" + re.escape(label) + r"\b", term):
         return True
+    
     tt, lt = _alnum_tokens(term), _alnum_tokens(label)
+    
     if tt and lt and tt & lt:
         return True
+    
     if SequenceMatcher(None, term, label).ratio() > _REL_SEQUENCE_RATIO_THRESHOLD:
         return True
+    
     return False
 
 
@@ -85,14 +90,16 @@ class CognitiveController:
     attention over a rolling context window.
     """
     
-    def __init__(self,
-                 agent: Optional[TensegrityAgent] = None,
-                 broca: Optional[BrocaInterface] = None,
-                 n_hypotheses: int = 8,
-                 hypothesis_labels: Optional[List[str]] = None,
-                 use_llm: bool = True,
-                 enable_hypothesis_generation: bool = False,
-                 confirmed_facts_max: int = 5):
+    def __init__(
+        self,
+        agent: Optional[TensegrityAgent] = None,
+        broca: Optional[BrocaInterface] = None,
+        n_hypotheses: int = 8,
+        hypothesis_labels: Optional[List[str]] = None,
+        use_llm: bool = True,
+        enable_hypothesis_generation: bool = False,
+        confirmed_facts_max: int = 5,
+    ):
         """
         Args:
             agent: TensegrityAgent instance. Created with defaults if None.
@@ -108,6 +115,7 @@ class CognitiveController:
         self.confirmed_facts_max = max(1, int(confirmed_facts_max))
         
         labels_for_hyp: Optional[List[str]] = None
+        
         if hypothesis_labels is not None:
             labels_for_hyp = list(hypothesis_labels)
             n_states = max(len(labels_for_hyp), n_hypotheses, 2)
@@ -172,11 +180,15 @@ class CognitiveController:
         count and clears conversational artifacts.
         """
         labels = list(hypothesis_labels)
+
         if not labels:
             labels = ["_empty_"]
+        
         n_hyp = max(len(labels), 2)
+        
         while len(labels) < n_hyp:
             labels.append(f"_empty_{len(labels)}")
+        
         self.agent = TensegrityAgent(
             n_states=n_hyp,
             n_observations=n_hyp * 4,
@@ -188,6 +200,7 @@ class CognitiveController:
             planning_horizon=2,
             precision=4.0,
         )
+        
         self.belief_state = BeliefState(
             turn=0,
             hypotheses=[],
@@ -198,6 +211,7 @@ class CognitiveController:
             epistemic_urgency=1.0,
             free_energy=0.0,
         )
+        
         self._init_hypotheses(labels)
         self._conversation.clear()
 
@@ -205,30 +219,40 @@ class CognitiveController:
         """Keep only the last ``confirmed_facts_max`` entries (rolling window)."""
         n = self.confirmed_facts_max
         facts = self.belief_state.confirmed_facts
+        
         if len(facts) > n:
             self.belief_state.confirmed_facts = facts[-n:]
 
     def _record_parsed_facts(self, parsed: ParsedObservation) -> None:
         """Append structured parse results to confirmed facts with consistent formatting."""
         turn = self.belief_state.turn
+        
         for entity in parsed.entities:
             fact = (
                 f"[T{turn}] Observed: {entity.normalized} ({entity.entity_type})"
             )
+        
             self.belief_state.confirmed_facts.append(fact)
+        
         for relation in parsed.relations:
             fact = f"[T{turn}] {relation.subject} {relation.predicate} {relation.object}"
+        
             if relation.negated:
                 fact = f"NOT({fact})"
+        
             self.belief_state.confirmed_facts.append(fact)
+        
         for relation in parsed.implicit_relations:
             fact = (
                 f"[T{turn}] (implicit) {relation.subject} "
                 f"{relation.predicate} {relation.object}"
             )
+        
             if relation.negated:
                 fact = f"NOT({fact})"
+        
             self.belief_state.confirmed_facts.append(fact)
+        
         self._trim_confirmed_facts()
     
     def perceive_only(self, input_text: str) -> Dict[str, Any]:
@@ -236,15 +260,19 @@ class CognitiveController:
         Parse and run perception + belief update only (no action / no verbalization).
         """
         self.belief_state.turn += 1
+
         if self.use_llm and self.broca:
             parsed = self.broca.parse(input_text, context=self._get_parse_context())
         else:
             parsed = self._template_parse(input_text)
+        
         obs_vector = self._observation_to_vector(parsed)
         perception = self.agent.perceive(obs_vector)
+        
         self._maybe_inject_causal_hypothesis(perception, input_text)
         self._update_hypotheses_from_inference(perception, obs_vector)
         self._record_parsed_facts(parsed)
+        
         return {
             "perception": {
                 "free_energy": perception["free_energy"],
@@ -260,16 +288,14 @@ class CognitiveController:
     def _init_hypotheses(self, labels: List[str]):
         """Initialize the hypothesis space with uniform priors."""
         n = len(labels)
-        self.belief_state.hypotheses = [
-            Hypothesis(
-                id=f"H{i}",
-                description=label,
-                probability=1.0 / n,
-                supporting_evidence=[],
-                contradicting_evidence=[],
-            )
-            for i, label in enumerate(labels)
-        ]
+        
+        self.belief_state.hypotheses = [Hypothesis(
+            id=f"H{i}",
+            description=label,
+            probability=1.0 / n,
+            supporting_evidence=[],
+            contradicting_evidence=[],
+        ) for i, label in enumerate(labels)]
     
     @staticmethod
     def _apply_relation_evidence(
@@ -282,21 +308,26 @@ class CognitiveController:
         for relation in relations:
             subj = relation.subject.lower()
             obj = relation.object.lower()
+            
             subj_matches = [
                 i for label, i in hyp_labels.items()
                 if _relation_term_matches_hypothesis(subj, label)
             ]
+            
             obj_matches = [
                 i for label, i in hyp_labels.items()
                 if _relation_term_matches_hypothesis(obj, label)
             ]
+            
             sign = -1.0 if relation.negated else 1.0
             w = weight
+            
             if relation.predicate in ("causes", "enables", "confirms", "is_a", "has_property"):
                 for idx in obj_matches:
                     features[idx] += 0.8 * sign * w
                 for idx in subj_matches:
                     features[idx] += 0.4 * sign * w
+            
             elif relation.predicate in ("prevents", "contradicts"):
                 for idx in obj_matches:
                     features[idx] -= 0.8 * sign * w
@@ -307,29 +338,40 @@ class CognitiveController:
         """If causal fit is poor, ask Broca for a new SCM and register it (LLM only)."""
         if not self.enable_hypothesis_generation or not self.use_llm or not self.broca:
             return
+        
         if not hasattr(self.broca, "propose_causal_hypothesis"):
             return
+        
         ar = perception.get("arena") or {}
+        
         if ar.get("tension", 0) < 0.72:
             return
+        
         lls = ar.get("log_likelihoods") or {}
+        
         if lls and max(lls.values()) > -2.0:
             return
+        
         try:
             names = list(self.agent.arena.models.keys())
             prop = self.broca.propose_causal_hypothesis(input_text[:2000], names)
             scm = build_scm_from_proposal(prop)
+        
             if scm.name in self.agent.arena.models:
                 return
+        
             self.agent.add_causal_model(scm)
             q = perception["belief_state"]
             obs_idx = perception["observation_index"]
+        
             causal_obs: Dict[str, int] = {
                 "state": int(np.argmax(q)),
                 "observation": int(obs_idx),
             }
+        
             if DEFAULT_MEDIATED_SCM_NAME in self.agent.arena.models:
                 causal_obs["cause"] = int(np.argmax(q))
+        
             perception["arena"] = self.agent.arena.compete(causal_obs)
         except (KeyError, ValueError, IndexError, TypeError) as e:
             logger.warning(
@@ -360,6 +402,7 @@ class CognitiveController:
         
         for entity in parsed.entities:
             ename = entity.normalized.lower()
+        
             # Direct match: entity IS a hypothesis
             if ename in hyp_labels:
                 features[hyp_labels[ename]] += 1.0
@@ -383,8 +426,9 @@ class CognitiveController:
         
         return features
     
-    def _update_hypotheses_from_inference(self, perception_result: Dict[str, Any],
-                                          obs_vector: np.ndarray):
+    def _update_hypotheses_from_inference(
+        self, perception_result: Dict[str, Any], obs_vector: np.ndarray,
+    ) -> None:
         """
         Update hypothesis probabilities using BOTH:
           1. Tensegrity's generic state inference (q_states)
@@ -403,6 +447,20 @@ class CognitiveController:
         
         # Get current priors
         priors = np.array([h.probability for h in self.belief_state.hypotheses])
+        eliminated = set(self.belief_state.eliminated_hypotheses)
+        active_mask = np.array(
+            [h.id not in eliminated for h in self.belief_state.hypotheses],
+            dtype=bool,
+        )
+        if not np.any(active_mask):
+            active_mask[:] = True
+        priors = np.where(active_mask, priors, 0.0)
+        prior_total = priors.sum()
+        if prior_total > 0:
+            priors = priors / prior_total
+        else:
+            priors = active_mask.astype(np.float64)
+            priors = priors / priors.sum()
         
         # Direct Bayesian update from observation vector
         # obs_vector acts as log-likelihood: positive = confirms, negative = contradicts
@@ -422,17 +480,27 @@ class CognitiveController:
         
         # Also incorporate Tensegrity's state inference (blend)
         q_engine = perception_result['belief_state']
+
         if len(q_engine) >= n:
             engine_probs = q_engine[:n]
         else:
             engine_probs = np.ones(n) / n
+        engine_probs = np.asarray(engine_probs, dtype=np.float64)
+        engine_probs = np.where(active_mask, engine_probs, 0.0)
+        engine_total = engine_probs.sum()
+        if engine_total > 0:
+            engine_probs = engine_probs / engine_total
+        else:
+            engine_probs = priors.copy()
         
         # Blend: 70% direct Bayesian, 30% engine inference
         # The direct update is more reliable when the parser extracts good signal
         blended = 0.7 * posterior + 0.3 * engine_probs
+        blended = np.where(active_mask, blended, 0.0)
         
         # Normalize
         total = blended.sum()
+        
         if total > 0:
             blended /= total
         else:
@@ -445,13 +513,18 @@ class CognitiveController:
         
         # Eliminate hypotheses below threshold
         threshold = 0.005
+        
         for hyp in self.belief_state.hypotheses:
-            if hyp.probability < threshold and hyp.id not in self.belief_state.eliminated_hypotheses:
+            if hyp.id in eliminated:
+                hyp.probability = 0.0
+            elif hyp.probability < threshold:
                 self.belief_state.eliminated_hypotheses.append(hyp.id)
+                eliminated.add(hyp.id)
                 hyp.probability = 0.0
         
         # Re-normalize after elimination
         total = sum(h.probability for h in self.belief_state.hypotheses)
+        
         if total > 0:
             for h in self.belief_state.hypotheses:
                 h.probability /= total
@@ -463,6 +536,7 @@ class CognitiveController:
         # Epistemic urgency: normalized entropy of posterior
         probs = np.array([h.probability for h in self.belief_state.hypotheses])
         probs = probs[probs > 0]
+        
         if len(probs) > 1:
             entropy = float(-np.sum(probs * np.log(probs + 1e-16)))
             max_entropy = float(np.log(len(probs)))
@@ -495,6 +569,7 @@ class CognitiveController:
             if max_prob > 0.85:
                 action_type = "state_conclusion"
             elif max_prob < 0.15 and any(h.probability > 0.3 for h in self.belief_state.hypotheses):
+                logger.info(f"Some hypothesis just dropped — eliminating: {max_prob}")
                 # Some hypothesis just dropped — eliminate it
                 pass  # Let the EFE-selected action stand
         
@@ -509,11 +584,13 @@ class CognitiveController:
                 # Ask about the hypothesis with highest entropy contribution
                 active = [h for h in self.belief_state.hypotheses 
                          if h.id not in self.belief_state.eliminated_hypotheses]
+
                 if active:
                     # Ask about the hypothesis closest to 0.5 (most uncertain)
                     most_uncertain = min(active, key=lambda h: abs(h.probability - 0.5))
                     target = most_uncertain.description
                     content = f"Need to distinguish: {most_uncertain.description}"
+
             confidence = self.belief_state.epistemic_urgency
             
         elif action_type == "state_conclusion":
@@ -531,6 +608,7 @@ class CognitiveController:
                     key=lambda h: h.probability,
                     default=None
                 )
+                
                 if weakest:
                     target = weakest.description
                     content = f"Ruling out {weakest.description}"
@@ -645,21 +723,27 @@ class CognitiveController:
         # Add new information
         for info in feedback.new_information:
             self.belief_state.confirmed_facts.append(f"[T{self.belief_state.turn}] {info}")
+        
         self._trim_confirmed_facts()
+        
         return self.step(feedback_text)
     
     def _get_parse_context(self) -> str:
         """Build context string for parse calls."""
         ctx_parts = []
+        
         if self.belief_state.confirmed_facts:
             slice_n = self.confirmed_facts_max
             facts_str = '; '.join(self.belief_state.confirmed_facts[-slice_n:])
             ctx_parts.append(f"Known facts: {facts_str}")
+        
         if self.belief_state.hypotheses:
             active = [h for h in self.belief_state.hypotheses 
                      if h.id not in self.belief_state.eliminated_hypotheses]
+        
             if active:
                 ctx_parts.append(f"Active hypotheses: {', '.join(h.description for h in active[:5])}")
+        
         return " | ".join(ctx_parts) if ctx_parts else "New conversation"
     
     def _template_parse(self, text: str) -> ParsedObservation:
@@ -683,21 +767,25 @@ class CognitiveController:
         
         # 1. Find hypothesis mentions in text
         mentioned_hyps = []
+        
         for label in hyp_labels:
             # Check for the label or its parts in the text
             label_parts = label.replace("_", " ").split()
+        
             for part in label_parts:
                 if len(part) > 2 and part in text_lower:
                     mentioned_hyps.append(label)
                     entities.append(EntityMention(
                         text=part, entity_type="object", normalized=label
                     ))
+        
                     break
         
         # 2. Detect semantic polarity markers
         positive_markers = {"has", "can", "is", "does", "with", "found", "seen", 
                           "shows", "resembl", "over", "common", "confirm", "support",
                           "toward", "point", "evidence", "known", "happen"}
+        
         negative_markers = {"not", "no", "never", "without", "lacks", "doesn't", 
                           "isn't", "can't", "won't", "neither", "nor", "rule",
                           "doesn't", "cannot", "absent", "miss"}
@@ -736,10 +824,12 @@ class CognitiveController:
                 entities.append(EntityMention(
                     text=keyword, entity_type="property", normalized=keyword
                 ))
+        
                 # Create relations between property and associated hypotheses
                 for ahyp in associated_hyps:
                     if ahyp.lower() in [h.lower() for h in hyp_labels]:
                         predicate = "confirms" if not has_negative else "contradicts"
+        
                         relations.append(RelationMention(
                             subject=keyword,
                             predicate=predicate,
@@ -750,6 +840,7 @@ class CognitiveController:
         # 4. If text directly mentions a hypothesis with sentiment
         for label in hyp_labels:
             parts = label.replace("_", " ").split()
+        
             for part in parts:
                 if len(part) > 2 and part in text_lower:
                     if has_negative and not has_positive:
@@ -790,6 +881,7 @@ class CognitiveController:
             "defer": "I need more information before I can say.",
             "request_intervention": f"What would change if we modified {action.target}?",
         }
+        
         return templates.get(action.action_type, str(action.content))
     
     def _template_parse_feedback(self, text: str) -> ParsedFeedback:
@@ -820,12 +912,14 @@ class CognitiveController:
         
         if self.belief_state.hypotheses:
             lines.append("\nHypotheses:")
+        
             for h in sorted(self.belief_state.hypotheses, key=lambda x: x.probability, reverse=True):
                 status = "✗" if h.id in self.belief_state.eliminated_hypotheses else " "
                 lines.append(f"  [{status}] {h.id} {h.description}: {h.probability:.4f}")
         
         if self.belief_state.confirmed_facts:
             lines.append(f"\nConfirmed facts ({len(self.belief_state.confirmed_facts)}):")
+        
             for fact in self.belief_state.confirmed_facts[-5:]:
                 lines.append(f"  {fact}")
         

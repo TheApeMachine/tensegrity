@@ -14,7 +14,13 @@ from tensegrity.engine.fhrr import (
     unbind,
     permute,
 )
-from tensegrity.engine.causal_energy import EnergyCausalArena, CausalEnergyTerm
+from tensegrity.engine.causal_energy import (
+    EnergyCausalArena,
+    CausalEnergyTerm,
+    TopologyMapper,
+    TopologyMapping,
+    VirtualParent,
+)
 from tensegrity.engine.scoring import ScoringBridge, NGCLogitsProcessor
 
 __all__ = (
@@ -32,6 +38,9 @@ __all__ = (
     "permute",
     "EnergyCausalArena",
     "CausalEnergyTerm",
+    "TopologyMapper",
+    "TopologyMapping",
+    "VirtualParent",
     "ScoringBridge",
     "NGCLogitsProcessor",
 )
