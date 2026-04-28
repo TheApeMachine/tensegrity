@@ -251,7 +251,11 @@ def test_memory_systems():
     # Soft retrieval (Boltzmann distribution)
     blended, weights = am.retrieve_soft(noisy)
     print(f"  Soft retrieval weights (top 3): {sorted(weights)[-3:]}")
-    assert best_match == 3
+    assert best_match == 3, (
+        "expected best_match == 3 (associative retrieval of pattern 3) with numpy seed "
+        "42 set at module load, "
+        f"got best_match={best_match}"
+    )
     print(f"  ✓ Content-addressed retrieval via energy minimization")
     print(f"  Stats: {am.statistics}")
 

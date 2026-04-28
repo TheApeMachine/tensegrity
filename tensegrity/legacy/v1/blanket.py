@@ -34,6 +34,11 @@ class MarkovBlanket:
     
     The blanket enforces the Markov property: internal states
     are conditionally independent of external states given the blanket.
+
+    ``n_sensory`` / ``n_active`` mirror constructor channel counts and are
+    reserved for future multi-channel I/O; ``sense`` still ingests vectors
+    shaped for ``encoder.n_dims``, and ``act`` consumes the full softmax over
+    actions passed in.
     """
     
     def __init__(self, 
@@ -59,15 +64,16 @@ class MarkovBlanket:
         # Observation buffer — recent history for temporal inference
         self.observation_buffer: deque = deque(maxlen=observation_buffer_size)
         
-        # Statistics for the blanket boundary (running means/vars for normalization)
-        self._obs_count = 0
-        self._obs_sum = None
-        self._obs_sq_sum = None
+        # Running stats for surprise — per-coordinate counts (variable-length obs).
+        self._sense_timestep = 0
+        self._obs_sum: Optional[np.ndarray] = None
+        self._obs_sq_sum: Optional[np.ndarray] = None
+        self._obs_elem_count: Optional[np.ndarray] = None
         
         # Blanket surprise (how unexpected was the last observation?)
         self.surprise: float = 0.0
     
-    def sense(self, raw_observation: np.ndarray) -> np.ndarray:
+    def sense(self, raw_observation: np.ndarray, *, allow_multi_point_1d: bool = False) -> np.ndarray:
         """
         Process a raw observation through the sensory boundary.
         
@@ -76,8 +82,11 @@ class MarkovBlanket:
         3. Compute surprise (deviation from running statistics)
         
         Args:
-            raw_observation: Raw sensory data, shape depends on modality.
-                           Will be reshaped to (n_points, n_dims) for Morton encoding.
+            raw_observation: Array shaped ``(n_points, encoder.n_dims)``, or ``(n_dims,)``
+                for one point. One-dimensional vectors whose length is not ``n_dims``
+                are rejected unless ``allow_multi_point_1d=True`` is set, which treats
+                the vector as a column (``reshape(-1, 1)``) of scalar observations —
+                callers should prefer supplying an explicit `(n_points, n_dims)` array.
         
         Returns:
             Morton-coded observation as integer array
@@ -86,14 +95,22 @@ class MarkovBlanket:
         if raw_observation.ndim == 1:
             if len(raw_observation) == self.encoder.n_dims:
                 raw_observation = raw_observation.reshape(1, -1)
-            else:
-                # Treat as multiple single-dim observations
+            elif allow_multi_point_1d:
                 raw_observation = raw_observation.reshape(-1, 1)
+            else:
+                raise ValueError(
+                    f"One-dimensional sensory input length {len(raw_observation)} does not match "
+                    f"encoder.n_dims ({self.encoder.n_dims}). Pass shape "
+                    "(n_points, n_dims), a length-n_dims vector for one observation, "
+                    "or opt in with allow_multi_point_1d=True for reshape(-1, 1)."
+                )
         
         # Morton encode
         morton_codes = self.encoder.encode_continuous(raw_observation)
         if isinstance(morton_codes, (int, np.integer)):
             morton_codes = np.array([morton_codes])
+
+        self._sense_timestep += 1
         
         # Update running statistics for surprise computation
         self._update_statistics(raw_observation)
@@ -107,7 +124,7 @@ class MarkovBlanket:
             'morton': morton_codes.copy(),
             'raw': raw_observation.copy(),
             'surprise': self.surprise,
-            'timestamp': self._obs_count
+            'timestamp': self._sense_timestep
         })
         
         return morton_codes
@@ -137,17 +154,23 @@ class MarkovBlanket:
     
     def _update_statistics(self, observation: np.ndarray):
         """Update running statistics for surprise computation."""
-        flat = observation.flatten()
-        self._obs_count += 1
+        flat = np.asarray(observation, dtype=np.float64).flatten()
         
         if self._obs_sum is None:
-            self._obs_sum = np.zeros_like(flat, dtype=np.float64)
-            self._obs_sq_sum = np.zeros_like(flat, dtype=np.float64)
-        
-        # Pad or truncate to match
-        n = min(len(flat), len(self._obs_sum))
+            self._obs_sum = np.zeros(len(flat), dtype=np.float64)
+            self._obs_sq_sum = np.zeros(len(flat), dtype=np.float64)
+            self._obs_elem_count = np.zeros(len(flat), dtype=np.float64)
+
+        lf, ls = len(flat), len(self._obs_sum)
+        if lf > ls:
+            self._obs_sum = np.pad(self._obs_sum, (0, lf - ls), mode='constant')
+            self._obs_sq_sum = np.pad(self._obs_sq_sum, (0, lf - ls), mode='constant')
+            self._obs_elem_count = np.pad(self._obs_elem_count, (0, lf - ls), mode='constant')
+
+        n = min(lf, len(self._obs_sum))
         self._obs_sum[:n] += flat[:n]
         self._obs_sq_sum[:n] += flat[:n] ** 2
+        self._obs_elem_count[:n] += 1.0
     
     def _compute_surprise(self, observation: np.ndarray) -> float:
         """
@@ -156,14 +179,15 @@ class MarkovBlanket:
         This is a simple proxy — the full surprise comes from the
         free energy engine. But this gives a fast heuristic at the boundary.
         """
-        if self._obs_count < 2:
-            return 0.0
-        
-        flat = observation.flatten()
+        flat = np.asarray(observation, dtype=np.float64).flatten()
+        assert self._obs_sum is not None and self._obs_elem_count is not None
         n = min(len(flat), len(self._obs_sum))
-        
-        mean = self._obs_sum[:n] / self._obs_count
-        var = self._obs_sq_sum[:n] / self._obs_count - mean ** 2
+        cnt = self._obs_elem_count[:n]
+        if n < 1 or float(np.min(cnt)) < 2.0:
+            return 0.0
+
+        mean = self._obs_sum[:n] / np.maximum(cnt, 1e-12)
+        var = self._obs_sq_sum[:n] / np.maximum(cnt, 1e-12) - mean ** 2
         var = np.maximum(var, 1e-8)  # Prevent division by zero
         
         # Gaussian log-likelihood (negative = surprise)
@@ -187,7 +211,7 @@ class MarkovBlanket:
             'sensory': self.sensory_state,
             'active': self.active_state,
             'surprise': self.surprise,
-            'obs_count': self._obs_count,
+            'sense_timestep': self._sense_timestep,
             'buffer_size': len(self.observation_buffer)
         }
 

@@ -22,6 +22,11 @@ __all__ = (
 )
 
 
+def __dir__():
+    merged = set(globals().keys()) | set(__all__)
+    return sorted(merged)
+
+
 def __getattr__(name: str) -> Any:
     if name == "HybridPipeline":
         value = getattr(import_module("tensegrity.graft.pipeline"), name)

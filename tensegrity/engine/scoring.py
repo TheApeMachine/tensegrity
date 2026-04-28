@@ -274,7 +274,6 @@ class ScoringBridge:
         if hasattr(features, '_ensure_sbert') and getattr(features, '_sbert', None) is None:
             features._ensure_sbert()
         if hasattr(features, '_sbert') and features._sbert is not None and features._sbert != "FALLBACK":
-            features._ensure_sbert()
             embs = features._sbert.encode([prompt] + choices, show_progress_bar=False)
             pe, pn = embs[0], np.linalg.norm(embs[0])
             return [float(np.dot(pe, embs[i+1]) / (pn * np.linalg.norm(embs[i+1])))
@@ -288,6 +287,10 @@ class ScoringBridge:
             enc = self.field.encoder.encode_sequence(ct) if ct else np.ones(self.field.fhrr_dim, dtype=np.complex64)
             out.append(self.field.encoder.similarity(pf, enc))
         return out
+    
+    def sentence_similarities(self, prompt, choices):
+        """Public alias for SBERT/FHRR sentence-level similarity tie-breaks (see ``_sentence_similarities``)."""
+        return self._sentence_similarities(prompt, choices)
     
     def reset(self):
         self.field.ngc.reinitialize(12345)

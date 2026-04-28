@@ -390,6 +390,13 @@ class PredictiveCodingCircuit:
         """Drop recorded energy / error traces."""
         self.energy_history.clear()
         self.error_history.clear()
+
+    def soft_reset(self) -> None:
+        """Clear layer activations and history without resampling prediction weights."""
+        self.layers = []
+        self._initialized = False
+        self._last_obs = None
+        self.clear_history()
     
     def reinitialize(self, weight_seed: int = 12345) -> None:
         """Reset layer states and resample W/E."""

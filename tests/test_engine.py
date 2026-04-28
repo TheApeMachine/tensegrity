@@ -3,6 +3,7 @@ Tests for the unified cognitive engine: FHRR, NGC, and UnifiedField.
 """
 
 import numpy as np
+import sys
 np.random.seed(42)
 
 
@@ -68,7 +69,10 @@ def test_fhrr_encoding():
     sim_numeric_far = enc.similarity(v_base, v_far)
     print(f"\n  sim([1,2,3], [1,2,3.1]) = {sim_near:.4f}")
     print(f"  sim([1,2,3], [9,8,7])   = {sim_numeric_far:.4f}")
-    assert sim_near > sim_numeric_far
+    assert sim_near > sim_numeric_far, (
+        "Numeric vectors should be more similar when inputs are nearer in value space "
+        f"(sim_near={sim_near}, sim_far={sim_numeric_far})"
+    )
     print(f"  ✓ Numeric vectors: similar inputs → similar encodings")
 
 

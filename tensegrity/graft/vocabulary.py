@@ -20,6 +20,7 @@ and the LLM's continuous logit space.
 """
 
 import re
+import logging
 from typing import Callable, Dict, Iterable, List, Set, Optional, Tuple
 from dataclasses import dataclass, field
 
@@ -27,6 +28,22 @@ import numpy as np
 
 
 EmbeddingFn = Callable[[str], np.ndarray]
+BatchedEmbedFn = Callable[[List[str]], np.ndarray]
+
+
+logger = logging.getLogger(__name__)
+
+
+def _cosine_similarity_to_graft_multiplier(score: float) -> float:
+    """Map cosine proximity in roughly [-1, 1] to ``hypothesis_token_scores`` weights **[0.0, 1.0]**."""
+
+    return float(max(0.0, min(1.0, 0.5 * (float(score) + 1.0))))
+
+
+def _chunks(seq: List, size: int) -> Iterable[List]:
+    bs = max(1, size)
+    for i in range(0, len(seq), bs):
+        yield seq[i:i + bs]
 
 
 def _clean_token_text(token: str) -> str:
@@ -48,7 +65,7 @@ def _as_unit_vector(value: np.ndarray) -> np.ndarray:
     vec = np.asarray(value, dtype=np.float64).ravel()
     norm = float(np.linalg.norm(vec))
     if norm <= 1e-12:
-        return vec
+        return np.zeros_like(vec, dtype=np.float64)
     return vec / norm
 
 
@@ -106,16 +123,66 @@ class SemanticProjectionLayer:
         embedding_fn: EmbeddingFn,
         projection_matrix: Optional[np.ndarray] = None,
         token_texts: Optional[Dict[int, str]] = None,
+        *,
+        batched_embedding_fn: Optional[BatchedEmbedFn] = None,
+        batch_size: int = 256,
     ) -> "SemanticProjectionLayer":
         texts = token_texts or _token_texts_from_tokenizer(tokenizer)
-        token_vectors: Dict[int, np.ndarray] = {}
-        for tid, text in texts.items():
+        token_vectors = {}
+        tids_ordered = sorted(texts.keys(), key=lambda x: int(x))
+        pairs = [(k, texts[k]) for k in tids_ordered]
+
+        filled = False
+
+        def apply_rows(row_tids: List[int], vectors: np.ndarray) -> None:
+            if vectors.ndim != 2 or vectors.shape[0] != len(row_tids):
+                raise ValueError("batched embeddings must have shape (batch, dim)")
+            for tid, row in zip(row_tids, vectors):
+                vec = _as_unit_vector(np.asarray(row, dtype=np.float64))
+                if vec.size and np.linalg.norm(vec) > 1e-12:
+                    token_vectors[int(tid)] = vec
+
+        if batched_embedding_fn is not None and pairs:
             try:
-                vec = _as_unit_vector(embedding_fn(text))
-            except Exception:
-                continue
-            if vec.size and np.linalg.norm(vec) > 1e-12:
-                token_vectors[int(tid)] = vec
+                for chunk_pairs in _chunks(pairs, batch_size):
+                    chunk_strings = [p[1] for p in chunk_pairs]
+                    chunk_ids = [p[0] for p in chunk_pairs]
+                    batch_out = batched_embedding_fn(chunk_strings)
+                    mat = np.asarray(batch_out, dtype=np.float64)
+                    apply_rows(chunk_ids, mat)
+                filled = True
+            except Exception as e:
+                logger.warning(
+                    "batched_embedding_fn failed (%s); falling back to per-token embedding_fn",
+                    e,
+                )
+                token_vectors.clear()
+
+        if not filled and pairs:
+            try:
+                maybe = embedding_fn([p[1] for p in pairs])  # type: ignore[arg-type,misc]
+                mat = np.asarray(maybe, dtype=np.float64)
+                ids = [p[0] for p in pairs]
+                if mat.ndim == 2 and mat.shape[0] == len(ids):
+                    apply_rows(ids, mat)
+                    filled = True
+            except TypeError:
+                filled = False
+            except Exception as e:
+                logger.debug(
+                    "embedding_fn batch call unsupported (%s); using per-token path", e
+                )
+                filled = False
+
+        if not filled:
+            for tid, text in texts.items():
+                try:
+                    vec = _as_unit_vector(embedding_fn(text))
+                except Exception:
+                    continue
+                if vec.size and np.linalg.norm(vec) > 1e-12:
+                    token_vectors[int(tid)] = vec
+
         return cls(
             token_vectors=token_vectors,
             token_texts={int(k): v for k, v in texts.items()},
@@ -182,7 +249,7 @@ class VocabularyGrounding:
     # {hypothesis_id: list of grounding keywords}
     hypothesis_keywords: Dict[str, List[str]] = field(default_factory=dict)
 
-    # {hypothesis_id: {token_id: semantic proximity in [roughly -1, 1]}}
+    # Per-token multipliers **[0.0, 1.0]** for logit graft (see tensegrity.graft.logit_bias).
     hypothesis_token_scores: Dict[str, Dict[int, float]] = field(default_factory=dict)
     
     # Inverse map: {token_id: list of hypothesis_ids it belongs to}
@@ -260,6 +327,8 @@ class VocabularyGrounding:
         token_texts: Optional[Dict[int, str]] = None,
         top_k: int = 32,
         threshold: Optional[float] = None,
+        vocab_batch_embedding_fn: Optional[BatchedEmbedFn] = None,
+        vocab_embedding_batch_size: int = 256,
     ) -> 'VocabularyGrounding':
         """
         Build grounding by semantic proximity instead of exact keyword matches.
@@ -273,12 +342,18 @@ class VocabularyGrounding:
             token_texts: optional explicit {token_id: token_text} inventory.
             top_k: maximum vocabulary tokens retained per hypothesis.
             threshold: minimum cosine similarity. ``None`` keeps the best top_k.
+            vocab_batch_embedding_fn: optional batched vocabulary embed ``list[str] -> ndarray``.
+            vocab_embedding_batch_size: batch chunk size for ``SemanticProjectionLayer.from_tokenizer``.
+            Token scores returned from cosine matching are normalized to graft weights in **[0.0, 1.0]**
+                (affine map from ``[-1, 1]`` cosine range) before storage in ``hypothesis_token_scores``.
         """
         projection = SemanticProjectionLayer.from_tokenizer(
             tokenizer,
             embedding_fn=embedding_fn,
             projection_matrix=projection_matrix,
             token_texts=token_texts,
+            batched_embedding_fn=vocab_batch_embedding_fn,
+            batch_size=max(1, int(vocab_embedding_batch_size)),
         )
         grounding = cls()
         grounding.vocab_size = int(getattr(tokenizer, "vocab_size", 0) or 0)
@@ -293,15 +368,30 @@ class VocabularyGrounding:
             concept_vector = _mean_unit_vector(
                 embedding_fn(phrase) for phrase in concept_phrases if str(phrase).strip()
             )
+            if (
+                concept_vector.size == 0
+                or float(np.linalg.norm(concept_vector)) <= 1e-12
+            ):
+                logger.warning(
+                    "empty or zero-norm concept vector for hypothesis %r phrases=%s; "
+                    "skipping projection",
+                    hyp_id,
+                    hypothesis_phrases.get(hyp_id, phrases),
+                )
+                grounding.hypothesis_token_scores[hyp_id] = {}
+                grounding.hypothesis_tokens[hyp_id] = set()
+                continue
             token_scores = projection.project_phrase_vector(
                 concept_vector,
                 top_k=top_k,
                 threshold=threshold,
             )
-            grounding.hypothesis_token_scores[hyp_id] = token_scores
-            grounding.hypothesis_tokens[hyp_id] = set(token_scores)
+            grounding.hypothesis_token_scores[hyp_id] = {
+                tid: _cosine_similarity_to_graft_multiplier(s) for tid, s in token_scores.items()
+            }
+            grounding.hypothesis_tokens[hyp_id] = set(grounding.hypothesis_token_scores[hyp_id])
 
-            for tid in token_scores:
+            for tid in grounding.hypothesis_token_scores[hyp_id]:
                 grounding.token_to_hypotheses.setdefault(tid, []).append(hyp_id)
 
         return grounding

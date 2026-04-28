@@ -38,6 +38,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 
 from tensegrity.broca.controller import CognitiveController
+from tensegrity.broca.schemas import BeliefState, Hypothesis
 from tensegrity.bench.tasks import TaskSample
 from tensegrity.causal.scm import StructuralCausalModel
 from tensegrity.engine.causal_energy import (
@@ -75,6 +76,7 @@ class CommitResult:
     final_arena_tension: float
     final_energy_arena_tension: float
     trace: List[IterationStep] = field(default_factory=list)
+    initial_perception: Optional[Dict[str, Any]] = None
 
 
 def _alphanum_tokens(text: str, max_tokens: int) -> List[str]:
@@ -179,15 +181,17 @@ class CanonicalPipeline:
         # The controller resets itself per item; here we additionally clear the
         # Hopfield bank, episodic memory, and energy arena.
         try:
-            self.controller.agent.field.memory.patterns.clear()
-            self.controller.agent.field.memory._matrix = None
-            self.controller.agent.field.memory._dirty = True
+            self.controller.agent.field.memory.clear()
+        except AttributeError as e:
+            logger.warning("Hopfield clear failed (missing clear): %s", e)
         except Exception as e:
-            logger.debug("Hopfield clear skipped: %s", e)
+            logger.error("Hopfield clear failed: %s", e, exc_info=True)
         try:
             self.controller.agent.episodic.clear()
+        except AttributeError as e:
+            logger.warning("Episodic clear failed: %s", e)
         except Exception as e:
-            logger.debug("Episodic clear skipped: %s", e)
+            logger.error("Episodic clear failed: %s", e, exc_info=True)
         self.energy_arena = EnergyCausalArena(
             precision=self.energy_arena.precision,
             beta=self.energy_arena.beta,
@@ -235,13 +239,15 @@ class CanonicalPipeline:
                 n_ngc_layers = len(self.controller.agent.field.ngc.layer_sizes)
                 topology = self._topology_mapper.from_scm(scm, n_layers=n_ngc_layers)
                 self._scm_topologies[scm.name] = topology
-            except ValueError:
-                # Already registered (rare; defensive).
-                pass
+            except ValueError as e:
+                logger.warning(
+                    "Topology registration failed for SCM %r: %s",
+                    getattr(scm, "name", "?"),
+                    e,
+                )
 
     def _soft_reset_in_place(self, labels: List[str]) -> None:
         """Reset only what is per-item, keeping the heavy state intact."""
-        from tensegrity.broca.schemas import BeliefState, Hypothesis
 
         # Fresh hypotheses with uniform prior over the choice labels.
         n = len(labels)
@@ -269,15 +275,13 @@ class CanonicalPipeline:
         # NGC working state: clear activations/history but keep the learned
         # weights (cross-item priors) and the Hopfield bank.
         try:
-            ngc = self.controller.agent.field.ngc
-            ngc.layers = []
-            ngc._initialized = False
-            ngc._last_obs = None
-            ngc.clear_history()
+            self.controller.agent.field.ngc.soft_reset()
             self.controller.agent.field.energy_history.clear()
             self.controller.agent.field._step_count = 0
+        except AttributeError as e:
+            logger.warning("NGC soft_reset skipped (API mismatch): %s", e)
         except Exception as e:
-            logger.debug("NGC soft-reset skipped: %s", e)
+            logger.error("NGC soft_reset failed: %s", e, exc_info=True)
 
     # ---------- per-choice SCM (used by EnergyCausalArena) ----------
 
@@ -293,7 +297,7 @@ class CanonicalPipeline:
         is exactly what turns the lateral coherence link into a virtual parent
         in the NGC hierarchy, addressing the topological-mismatch critique.
         """
-        scm = StructuralCausalModel(name=f"choice_{choice_idx}")
+        scm = StructuralCausalModel(name=f"choice_{choice_idx}_{label}")
         scm.add_variable("prompt_feature", n_values=4, parents=[])
         scm.add_variable("coherence", n_values=4, parents=[])
         scm.add_variable("choice_match", n_values=4, parents=["prompt_feature"])
@@ -356,8 +360,11 @@ class CanonicalPipeline:
                 field.ngc.settle(choice_obs, steps=self.falsify_settle_steps)
                 pe = float(field.ngc.prediction_error(prompt_obs))
             except Exception as e:
-                logger.debug("falsification step failed for choice %d: %s", i, e)
-                pe = 0.0
+                logger.error(
+                    "NGC falsification failed for choice %d: %s",
+                    i, e, exc_info=True,
+                )
+                pe = float(1e9)
             scores[i] = -pe
 
             # Derive a compact discrete observation for the energy arena.
@@ -396,6 +403,8 @@ class CanonicalPipeline:
     def _bucket_4(x: float) -> int:
         """Map a real-valued summary to a 4-bucket discrete value via tanh."""
         v = math.tanh(x / 2.0)  # in (-1, 1)
+        if math.isnan(x) or math.isnan(v):
+            return 2
         # Map (-1, 1) to {0, 1, 2, 3}.
         return max(0, min(3, int((v + 1.0) * 2.0)))
 
@@ -495,12 +504,12 @@ class CanonicalPipeline:
                 final_energy_arena_tension=1.0,
             )
 
-        self._item_index += 1
         self.reset_for_item(sample)
+        self._item_index += 1
 
         # Initial perception — runs the full stack, including Broca SCM proposal
         # if causal tension is high (the controller wires this internally).
-        ing0 = self.ingest_prompt(sample.prompt)
+        initial_perception = self.ingest_prompt(sample.prompt)
 
         trace: List[IterationStep] = []
         converged = False
@@ -612,6 +621,7 @@ class CanonicalPipeline:
             final_arena_tension=final_arena_tension,
             final_energy_arena_tension=final_energy_tension,
             trace=trace,
+            initial_perception=initial_perception if n > 0 else None,
         )
 
     # ---------- helpers ----------

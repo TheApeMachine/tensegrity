@@ -201,6 +201,16 @@ class EpistemicMemory:
         
         self.evidence_log.append(log_lik)
         return log_lik
+
+    def _normalize_params_matrix(self, params: np.ndarray, *, axis: int) -> np.ndarray:
+        """Map Dirichlet parameters to expected categorical probs (does not touch access counts)."""
+        return params / np.maximum(params.sum(axis=axis, keepdims=True), 1e-16)
+
+    @staticmethod
+    def _normalize_params_vector(params: np.ndarray) -> np.ndarray:
+        """Normalize a vector Dirichlet parameter to probabilities."""
+        s = float(params.sum())
+        return params / max(s, 1e-16)
     
     def entropy(self) -> Dict[str, float]:
         """Compute non-negative categorical entropy of expected beliefs.
@@ -210,8 +220,8 @@ class EpistemicMemory:
         uncertainty dashboard metric.  The agent usually wants entropy of the
         expected categorical distributions it will actually act on.
         """
-        A = self.A_params / self.A_params.sum(axis=0, keepdims=True)
-        D = self.D_params / self.D_params.sum()
+        A = self._normalize_params_matrix(self.A_params, axis=0)
+        D = self._normalize_params_vector(self.D_params)
 
         a_entropy_by_state = -np.sum(A * np.log(np.maximum(A, 1e-16)), axis=0)
         d_entropy = -np.sum(D * np.log(np.maximum(D, 1e-16)))

@@ -7,6 +7,7 @@ import sys
 import time
 
 import numpy as np
+import pytest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
@@ -123,6 +124,7 @@ def test_build_scm_from_proposal():
 
 
 def test_scm_marginalizes_missing_parents_and_counterfactual_changes_descendants():
+    pytest.importorskip("networkx")
     from tensegrity.causal.scm import StructuralCausalModel
 
     scm = StructuralCausalModel("two_node")

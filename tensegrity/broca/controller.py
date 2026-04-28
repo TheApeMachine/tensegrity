@@ -569,8 +569,11 @@ class CognitiveController:
             if max_prob > 0.85:
                 action_type = "state_conclusion"
             elif max_prob < 0.15 and any(h.probability > 0.3 for h in self.belief_state.hypotheses):
-                logger.info(f"Some hypothesis just dropped — eliminating: {max_prob}")
-                # Some hypothesis just dropped — eliminate it
+                logger.info(
+                    "Competing hypotheses remain (max_prob=%.3f) — keeping EFE-selected "
+                    "action; no hypothesis elimination performed.",
+                    max_prob,
+                )
                 pass  # Let the EFE-selected action stand
         
         # Build the action content

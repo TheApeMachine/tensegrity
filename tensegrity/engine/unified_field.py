@@ -25,10 +25,13 @@ of the system minimizes its own local VFE, and the global behavior emerges
 from the composition of these local optimizations.
 """
 
+import logging
 import numpy as np
 from typing import Dict, List, Optional, Any, Tuple, Deque
 from dataclasses import dataclass
 from collections import deque
+
+_logger = logging.getLogger(__name__)
 
 from .fhrr import FHRREncoder, bind, bundle, unbind
 from .ngc import PredictiveCodingCircuit
@@ -67,7 +70,13 @@ class HopfieldMemoryBank:
         self.patterns: deque = deque(maxlen=capacity)
         self._matrix: Optional[np.ndarray] = None
         self._dirty = True
-    
+
+    def clear(self) -> None:
+        """Remove all stored patterns; invalidate the pattern matrix cache."""
+        self.patterns.clear()
+        self._matrix = None
+        self._dirty = True
+
     def store(self, pattern: np.ndarray, normalize: bool = True):
         """Store a pattern (FHRR vector — use real part for Hopfield)."""
         p = np.real(pattern).astype(np.float64) if np.iscomplexobj(pattern) else pattern.astype(np.float64)
@@ -111,6 +120,12 @@ class HopfieldMemoryBank:
         # Energy
         sims = self._matrix.T @ xi
         if self.beta <= 1e-12:
+            _logger.warning(
+                "HopfieldMemoryBank.retrieve: self.beta=%g is near zero; "
+                "energy uses approximate uniform-attention form "
+                "(0.5||xi||² - mean(sims)) instead of -lse/beta)",
+                float(self.beta),
+            )
             energy = float(0.5 * np.dot(xi, xi) - np.mean(sims))
         else:
             log_sum_exp = np.log(np.sum(np.exp(self.beta * sims - self.beta * sims.max()))) + self.beta * sims.max()

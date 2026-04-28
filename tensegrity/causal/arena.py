@@ -229,6 +229,15 @@ class CausalArena:
         In practice: find the variable where models disagree most about
         the effect of intervention, and suggest intervening on it.
         """
+        if not isinstance(n_samples, int) or n_samples <= 0:
+            raise ValueError(f"n_samples must be a positive int, got {n_samples!r}")
+        if not isinstance(n_outcome_samples, int) or n_outcome_samples < 1:
+            raise ValueError(
+                f"n_outcome_samples must be an int >= 1, got {n_outcome_samples!r}"
+            )
+
+        outcome_cap = min(n_samples, n_outcome_samples)
+
         if len(self.models) < 2:
             return {'intervention': None, 'expected_info_gain': 0.0}
         
@@ -254,9 +263,9 @@ class CausalArena:
                 info_gain = self._estimate_info_gain(
                     var, val,
                     n_samples=n_samples,
-                    n_outcome_samples=n_outcome_samples,
+                    n_outcome_samples=outcome_cap,
                 )
-        
+
                 if info_gain > best_info_gain:
                     best_info_gain = info_gain
                     best_experiment = {'variable': var, 'value': val}
@@ -294,33 +303,33 @@ class CausalArena:
         # Estimate expected posterior entropy after seeing outcomes
         # Use model-averaged predictions
         expected_tension = 0.0
-        n_outcome_samples = min(n_samples, max(1, int(n_outcome_samples)))
+        effective_outcome_samples = min(n_samples, max(1, n_outcome_samples))
         
         for name, outcomes in predicted_outcomes.items():
             model_weight = current_posterior.get(name, 1.0 / len(self.models))
             
-            for outcome in outcomes[:n_outcome_samples]:
+            for outcome in outcomes[:effective_outcome_samples]:
                 # What would the posterior look like if we saw this outcome?
                 hypothetical_log_liks = {}
-        
+
                 for m_name, model in self.models.items():
                     hypothetical_log_liks[m_name] = model.log_evidence([outcome])
-                
+
                 # Hypothetical posterior
                 hyp_evidence = {m: self.model_log_evidence[m] + hypothetical_log_liks[m]
                                for m in self.models}
-        
+
                 max_e = max(hyp_evidence.values())
-        
+
                 log_Z = max_e + np.log(sum(
                     np.exp(e - max_e) for e in hyp_evidence.values()))
-        
+
                 hyp_posterior = {m: np.exp(e - log_Z) for m, e in hyp_evidence.items()}
-                
+
                 expected_tension += model_weight * self._compute_tension(hyp_posterior)
-        
-        expected_tension /= max(n_outcome_samples, 1)
-        
+
+        expected_tension /= max(effective_outcome_samples, 1)
+
         # Information gain = current uncertainty - expected uncertainty after experiment
         return current_tension - expected_tension
     

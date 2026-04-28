@@ -19,8 +19,10 @@ This is what gives the cognitive layer real semantic knowledge.
 """
 
 import hashlib
+import threading
+from collections import OrderedDict
 import numpy as np
-from typing import Optional, List, Tuple, Dict, Union
+from typing import Any, Optional, List, Tuple, Dict, Union
 import logging
 
 logger = logging.getLogger(__name__)
@@ -93,6 +95,13 @@ class FHRRCodebook:
 
         return [(f"#{int(i)}", float(sims[i])) for i in top_idx]
 
+    def get_sbert_model(self) -> Optional[Any]:
+        """Non-semantic codebook has no SBERT model."""
+        return None
+
+    def has_sbert(self) -> bool:
+        return False
+
 
 class SemanticFHRRCodebook(FHRRCodebook):
     """
@@ -149,11 +158,34 @@ class SemanticFHRRCodebook(FHRRCodebook):
             self._proj /= np.sqrt(self._sbert_dim)
             logger.info(f"SemanticFHRR: loaded {self._sbert_model_name} "
                        f"(dim={self._sbert_dim}) → FHRR(dim={self.dim})")
-        except Exception as exc:
-            logger.warning("SemanticFHRR: falling back to deterministic random vectors (%s)", exc)
+        except ImportError as exc:
+            logger.warning(
+                "SemanticFHRR: sentence_transformers unavailable (%s); deterministic vectors",
+                exc,
+            )
             self._sbert = "FALLBACK"
             self._proj = None
-    
+        except OSError as exc:
+            logger.warning(
+                "SemanticFHRR: SBERT model load failed (%s); deterministic vectors",
+                exc,
+            )
+            self._sbert = "FALLBACK"
+            self._proj = None
+        except Exception:
+            logger.exception("SemanticFHRR: unexpected error loading SBERT")
+            raise
+
+    def get_sbert_model(self) -> Optional[Any]:
+        """Return the loaded ``SentenceTransformer`` when available; else ``None``."""
+        self._ensure_sbert()
+        if self._sbert is None or self._sbert == "FALLBACK":
+            return None
+        return self._sbert
+
+    def has_sbert(self) -> bool:
+        return self.get_sbert_model() is not None
+
     def _embed_to_phasor(self, embedding: np.ndarray) -> np.ndarray:
         projected = self._proj @ embedding.astype(np.float32)
         proj_std = np.std(projected)
@@ -262,8 +294,9 @@ class FHRREncoder:
         self.features = SemanticFHRRCodebook(dim=dim, sbert_model=sbert_model) if semantic \
             else FHRRCodebook(n_features, dim, seed=3000)
         
-        self._position_cache: Dict[int, np.ndarray] = {}
+        self._position_cache: OrderedDict[int, np.ndarray] = OrderedDict()
         self._position_cache_max = 4096
+        self._position_cache_lock = threading.Lock()
         
         for role in ["position", "value", "type", "attribute", "relation",
                      "subject", "object", "time", "channel"]:
@@ -285,20 +318,23 @@ class FHRREncoder:
     
     def encode_position(self, x: int) -> np.ndarray:
         x = int(x)
-        cached = self._position_cache.get(x)
-        
-        if cached is not None:
-            return cached.copy()
-        
+        with self._position_cache_lock:
+            cached = self._position_cache.get(x)
+            if cached is not None:
+                self._position_cache.move_to_end(x)
+                return cached.copy()
+
         result = np.ones(self.dim, dtype=np.complex64)
-        
+
         for base, m in zip(self._pos_bases, self.moduli):
             result = result * (base ** (x % m))
-        
-        if len(self._position_cache) < self._position_cache_max:
-            self._position_cache[x] = result.copy()
-        
-        return result
+
+        copied = result.copy()
+        with self._position_cache_lock:
+            while len(self._position_cache) >= self._position_cache_max:
+                self._position_cache.popitem(last=False)
+            self._position_cache[x] = copied
+            return copied.copy()
     
     def encode_value(self, value: float, precision: int = 100) -> np.ndarray:
         return self.encode_position(int(round(value * precision)))

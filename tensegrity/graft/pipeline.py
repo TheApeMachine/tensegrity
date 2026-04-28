@@ -38,10 +38,18 @@ logger = logging.getLogger(__name__)
 class HybridPipeline:
     """
     Tensegrity+LLM hybrid generation.
-    
+
     The cognitive layer resolves beliefs. The LLM narrates the resolution.
     Logit biases bridge the gap — no beliefs in the prompt, no reasoning
     delegated to the LLM.
+
+    **Memory:** When using the default SBERT embedder (``semantic_embedding_fn``
+    unset with ``semantic_grounding=True``), the returned closure from
+    ``_default_sbert_embed_fn`` holds a ``SentenceTransformer`` for the
+    pipeline's lifetime. That model can stay resident on GPU and consume
+    VRAM. Mitigations: set ``sbert_device='cpu'``, pass a smaller
+    ``sbert_model_name``, or supply a custom ``semantic_embedding_fn`` that
+    does not pin a large model (e.g. remote API, smaller encoder, on-demand load).
     """
     
     def __init__(
@@ -60,6 +68,8 @@ class HybridPipeline:
         # not available at runtime we fall back to keyword grounding.
         semantic_grounding: bool = True,
         semantic_embedding_fn: Optional[Callable[[str], np.ndarray]] = None,
+        sbert_model_name: str = "all-MiniLM-L6-v2",
+        sbert_device: Optional[str] = None,
         semantic_top_k: int = 32,
         semantic_threshold: Optional[float] = None,
     ):
@@ -78,8 +88,12 @@ class HybridPipeline:
             async_graft: Local mode only — poll beliefs in a background thread for non-blocking decode
             semantic_grounding: If True, build grounding by frozen semantic
                 phrase/token projection instead of exact keyword tokenization
-            semantic_embedding_fn: Required when semantic_grounding=True; maps
-                text to a fixed embedding vector without runtime training
+            semantic_embedding_fn: Optional when ``semantic_grounding`` is True. If omitted,
+                ``_build_grounding()`` supplies :func:`_default_sbert_embed_fn` using
+                ``sbert_model_name`` / ``sbert_device``. Pass an explicit callable to avoid the
+                long-lived SBERT model or customize embeddings.
+            sbert_model_name: sentence-transformers model ID for the default semantic embedder
+            sbert_device: Optional device hint for SBERT (e.g. ``"cpu"`` to avoid GPU residency)
             semantic_top_k: Semantic vocabulary tokens retained per hypothesis
             semantic_threshold: Optional minimum cosine similarity for semantic grounding
         """
@@ -92,6 +106,8 @@ class HybridPipeline:
         self.async_graft = async_graft
         self.semantic_grounding = semantic_grounding
         self.semantic_embedding_fn = semantic_embedding_fn
+        self.sbert_model_name = sbert_model_name
+        self.sbert_device = sbert_device
         self.semantic_top_k = semantic_top_k
         self.semantic_threshold = semantic_threshold
         
@@ -113,6 +129,7 @@ class HybridPipeline:
         # Generation tracking
         self._generations = 0
         self._graft_states: List[GraftState] = []
+        self._sbert_vocab_batch_fn: Optional[Callable[[List[str]], np.ndarray]] = None
 
     def _label_phrases(self) -> Dict[str, List[str]]:
         phrases = {}
@@ -124,6 +141,9 @@ class HybridPipeline:
     def _build_grounding(self) -> VocabularyGrounding:
         if self.semantic_grounding:
             embed = self.semantic_embedding_fn or self._default_sbert_embed_fn()
+            vocab_batch = getattr(self, "_sbert_vocab_batch_fn", None)
+            if self.semantic_embedding_fn is not None:
+                vocab_batch = None
             if embed is not None:
                 phrases = self._hypothesis_keywords or self._label_phrases()
                 try:
@@ -133,6 +153,7 @@ class HybridPipeline:
                         embedding_fn=embed,
                         top_k=self.semantic_top_k,
                         threshold=self.semantic_threshold,
+                        vocab_batch_embedding_fn=vocab_batch,
                     )
                 except Exception as e:
                     logger.warning(
@@ -145,24 +166,37 @@ class HybridPipeline:
             self.hypothesis_labels, self._tokenizer)
 
     def _default_sbert_embed_fn(self) -> Optional[Callable[[str], np.ndarray]]:
-        """Build a frozen sbert embedding function. Used when the caller did
-        not pass an explicit semantic_embedding_fn. No gradient flow.
+        """Return a callable that maps text → embedding via sentence-transformers.
 
-        Uses a bulk-prefetch cache: on first invocation, batch-encodes the
-        entire LLM vocabulary in one shot (a few seconds for ~128k tokens
-        on CPU) so the per-token loop in SemanticProjectionLayer.from_tokenizer
-        becomes a dict lookup instead of 128k individual sbert calls.
+        The closure captures ``model`` (:class:`~sentence_transformers.SentenceTransformer`)
+        for the pipeline's lifetime, so embeddings stay cheap after warm-up but the
+        model may hold GPU memory. Use ``sbert_device='cpu'``, a lighter
+        ``sbert_model_name``, or pass ``semantic_embedding_fn`` to avoid pinning
+        SBERT entirely.
         """
         try:
             from sentence_transformers import SentenceTransformer
         except Exception as e:
             logger.warning("sentence_transformers unavailable (%s); semantic grounding off", e)
+            self._sbert_vocab_batch_fn = None
             return None
         try:
-            model = SentenceTransformer("all-MiniLM-L6-v2")
+            st_kw: Dict[str, Any] = {}
+            if self.sbert_device is not None:
+                st_kw["device"] = self.sbert_device
+            model = SentenceTransformer(self.sbert_model_name, **st_kw)
         except Exception as e:
             logger.warning("could not load sbert (%s); semantic grounding off", e)
+            self._sbert_vocab_batch_fn = None
             return None
+
+        def _vocab_batch_encode(batch: List[str]) -> np.ndarray:
+            return np.asarray(
+                model.encode(batch, batch_size=256, show_progress_bar=False),
+                dtype=np.float32,
+            )
+
+        self._sbert_vocab_batch_fn = _vocab_batch_encode
 
         cache: Dict[str, np.ndarray] = {}
         bulk_done = [False]

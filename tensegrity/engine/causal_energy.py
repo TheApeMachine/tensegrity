@@ -16,6 +16,7 @@ when an energy-based readout of SCM fit is required.
 
 import numpy as np
 from dataclasses import dataclass, field
+from functools import cached_property
 from typing import Dict, List, Any, Optional, Tuple
 import networkx as nx
 from tensegrity.causal.scm import StructuralCausalModel
@@ -75,7 +76,11 @@ class VirtualParent:
     source: str
     target: str
     layer: int
-    children: Tuple[str, str]
+
+    @property
+    def children(self) -> Tuple[str, str]:
+        """The two SCM variables summarized by this virtual parent."""
+        return (self.source, self.target)
 
 
 @dataclass
@@ -96,16 +101,16 @@ class TopologyMapping:
     virtual_parents: Dict[str, VirtualParent] = field(default_factory=dict)
     original_edges: List[Tuple[str, str]] = field(default_factory=list)
 
-    @property
+    @cached_property
     def layer_nodes(self) -> Dict[int, List[str]]:
         layers: Dict[int, List[str]] = {}
-    
+
         for node, layer in self.embedded_layers.items():
             layers.setdefault(layer, []).append(node)
-    
+
         for nodes in layers.values():
             nodes.sort()
-    
+
         return dict(sorted(layers.items()))
 
     def ngc_layer_sizes(self, min_width: int = 1) -> List[int]:
@@ -156,7 +161,17 @@ class TopologyMapper:
     """
     Embed arbitrary SCM DAG topology into hierarchical predictive-coding wiring.
 
-    The mapper makes the Friston/Pearl handshake explicit:
+    Constructor flag ``expand_layers`` interacts with ``n_layers``:
+
+    - When ``expand_layers`` is **False**, a lateral or same-layer edge requiring a virtual
+      parent strictly above ``n_layers - 1`` raises ``ValueError`` (no implicit layer growth).
+
+    - When ``expand_layers`` is **True**, virtual-parent nodes **may occupy layer indices equal
+      to or **greater than** ``n_layers - 1** as needed — the mapper extends the conceptual
+      hierarchy upward so horizontal dependencies become shared parents. Caller layer counts
+      (e.g. ``ngc_layer_sizes``) must account for the actual maximum embedded layer index.
+
+    The mapper otherwise makes the Friston/Pearl handshake explicit:
 
     * A causal edge from layer k to k-1 becomes a direct top-down prediction.
     * A bypass edge spanning multiple layers receives relay nodes, one per
@@ -243,7 +258,7 @@ class TopologyMapper:
                 continue
 
             virtual_layer = max(source_layer, target_layer) + 1
-            
+
             if n_layers is not None and virtual_layer >= n_layers and not self.expand_layers:
                 raise ValueError(
                     f"edge {source!r}->{target!r} needs virtual parent layer {virtual_layer}, "
@@ -262,7 +277,6 @@ class TopologyMapper:
                 source=source,
                 target=target,
                 layer=virtual_layer,
-                children=(source, target),
             )
 
             virtual_parents[virtual] = vp

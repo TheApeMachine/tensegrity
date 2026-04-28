@@ -170,6 +170,13 @@ def test_ngc_contradiction_signal():
     print(f"\n  Memory similarity for truth: {r_truth['memory_similarity']:.4f}")
     assert np.isfinite(mean_contra_pe)
     assert np.isfinite(pe_truth_after)
+    assert not np.isclose(
+        mean_contra_pe, pe_truth_after, rtol=0.0, atol=1e-8
+    ), (
+        "Prediction error on contradictions should differ from prediction error "
+        f"when the established truth is re-presented "
+        f"(mean_contra_pe={mean_contra_pe:.6g}, pe_truth_after={pe_truth_after:.6g})"
+    )
 
 
 def test_needle_in_lies():

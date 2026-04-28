@@ -25,6 +25,13 @@ from copy import deepcopy
 from itertools import product
 
 
+class ControlledExpansionError(RuntimeError):
+    """Raised when counterfactual world enumeration exceeds a configured limit."""
+
+# Default safeguard for branching in ``StructuralCausalModel.counterfactual``.
+_DEFAULT_MAX_CF_WORLDS = 250_000
+
+
 class CausalMechanism:
     """
     A single causal mechanism: V_i := f_i(parents, noise).
@@ -71,15 +78,22 @@ class CausalMechanism:
         return self.cpt_params / self.cpt_params.sum(axis=0, keepdims=True)
     
     def parent_config_index(self, parent_values: Dict[str, int]) -> int:
-        """Convert parent values to a CPT column index."""
+        """Convert parent values to a CPT column index. All listed parents must be present."""
         if not self.parents:
             return 0
+        
+        missing = [p for p in self.parents if p not in parent_values]
+        if missing:
+            raise KeyError(
+                f"CausalMechanism({self.name!r}): parent_values missing keys {missing}; "
+                f"expected all of {list(self.parents)}"
+            )
         
         idx = 0
         stride = 1
         
         for p, card in zip(self.parents, self.parent_cardinalities):
-            value = int(parent_values.get(p, 0))
+            value = int(parent_values[p])
             idx += (value % max(int(card), 1)) * stride
             stride *= max(int(card), 1)
         
@@ -151,13 +165,21 @@ class StructuralCausalModel:
     def add_variable(self, name: str, n_values: int = 4,
                      parents: Optional[List[str]] = None,
                      noise_scale: float = 0.1):
-        """Add a variable with its causal mechanism."""
+        """Add a variable with its causal mechanism.
+
+        Every ``parent`` must already exist — call ``add_variable`` for parents first
+        with the desired ``n_values``. Parent cardinalities in CPT indexing come from
+        ``self.mechanisms[parent].n_values``.
+        """
         parents = parents or []
 
-        for parent in parents:
-            if parent not in self.graph:
-                # Auto-create parent as root node with the child's cardinality.
-                self.add_variable(parent, n_values)
+        missing = [p for p in parents if p not in self.graph]
+        if missing:
+            raise ValueError(
+                f"{self.name}: undefined parent variable(s) {missing} for '{name}'. "
+                "Declare each parent with add_variable(name, n_values=...) before "
+                "listing it in parents=[...]."
+            )
 
         parent_cardinalities = [self.mechanisms[p].n_values for p in parents]
         
@@ -257,7 +279,11 @@ class StructuralCausalModel:
     
     def counterfactual(self, evidence: Dict[str, int],
                        interventions: Dict[str, int],
-                       query: List[str]) -> Dict[str, np.ndarray]:
+                       query: List[str],
+                       *,
+                       max_cf_worlds: Optional[int] = None,
+                       prune_relative_weight_floor: Optional[float] = None,
+                       prune_worlds_top_k: Optional[int] = None) -> Dict[str, np.ndarray]:
         """
         Rung 3 — Counterfactual: P(Y_{do(x)} | observed evidence).
         
@@ -286,6 +312,8 @@ class StructuralCausalModel:
         posterior_worlds = self._posterior_assignments(evidence)
         if not posterior_worlds:
             return cf_results
+
+        ml = _DEFAULT_MAX_CF_WORLDS if max_cf_worlds is None else max(1, int(max_cf_worlds))
 
         order = self.topological_order()
         affected: Set[str] = set()
@@ -327,7 +355,41 @@ class StructuralCausalModel:
                         updated[var] = int(v)
                         next_worlds.append((updated, weight * float(p_v)))
 
+                if len(next_worlds) > ml:
+                    raise ControlledExpansionError(
+                        f"{self.name}: counterfactual branch count {len(next_worlds)} exceeds "
+                        f"max_cf_worlds={ml}; reduce SCM size / intervention breadth, "
+                        "or raise max_cf_worlds / use prune_worlds_top_k."
+                    )
                 worlds = next_worlds
+                if prune_worlds_top_k is not None and int(prune_worlds_top_k) > 0:
+                    tk = int(prune_worlds_top_k)
+                    if len(worlds) > tk:
+                        tot_before = sum(w for _, w in worlds)
+                        worlds = sorted(worlds, key=lambda t: -t[1])[:tk]
+                        tot_after = sum(w for _, w in worlds)
+                        if tot_before > 0 and tot_after > 0 and tot_after < tot_before:
+                            scale = tot_before / tot_after
+                            worlds = [(a, float(w * scale)) for a, w in worlds]
+                if prune_relative_weight_floor is not None:
+                    pq = float(prune_relative_weight_floor)
+                    if pq > 0.0 and worlds:
+                        mass = sum(w for _, w in worlds)
+                        if mass > 0:
+                            thresh = pq * mass
+                            kept = [(a, w) for a, w in worlds if w >= thresh]
+                            if kept:
+                                m2 = sum(w for _, w in kept)
+                                if m2 < mass > 0 and m2 > 0:
+                                    scale = mass / m2
+                                    worlds = [(a, w * scale) for a, w in kept]
+                                elif m2 <= 0:
+                                    raise ControlledExpansionError(
+                                        f"{self.name}: counterfactual pruning eliminated all worlds "
+                                        f"(increase prune_relative_weight_floor beyond {thresh})."
+                                    )
+                                else:
+                                    worlds = kept
 
             for values, weight in worlds:
                 for q in cf_results:
@@ -374,14 +436,17 @@ class StructuralCausalModel:
 
     def _joint_probability(self, assignment: Dict[str, int]) -> float:
         """P(assignment) under the SCM, assuming all variables are assigned."""
-        prob = 1.0
+        log_joint = 0.0
         for var in self.topological_order():
             mech = self.mechanisms[var]
             parent_vals = {p: assignment[p] for p in mech.parents}
-            prob *= float(np.exp(mech.log_prob(assignment[var], parent_vals)))
-            if prob <= 0.0:
+            ell = float(mech.log_prob(assignment[var], parent_vals))
+            if not np.isfinite(ell):
                 return 0.0
-        return float(prob)
+            log_joint += ell
+        if not np.isfinite(log_joint) or log_joint < -900.0:
+            return float(np.exp(max(log_joint, -900.0)))
+        return float(np.exp(log_joint))
 
     def _enumerate_joint_assignments(
         self,

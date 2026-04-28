@@ -138,6 +138,11 @@ class EpisodicMemory:
         if norm > 0:
             item_rep /= norm
         return item_rep
+
+    def compute_item_representation(self, observation: np.ndarray,
+                                     belief_state: np.ndarray) -> np.ndarray:
+        """Public entry point for projecting an observation + belief into context space."""
+        return self._compute_item_representation(observation, belief_state)
     
     def encode(self, observation: np.ndarray, morton_code: np.ndarray,
                belief_state: np.ndarray, action: Optional[int],

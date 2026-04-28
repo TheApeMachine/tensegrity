@@ -257,7 +257,7 @@ class EvalRunner:
                 prompt, return_tensors="pt",
                 truncation=True, max_length=512,
             )["input_ids"]
-            
+
             n_prompt = prompt_ids.shape[1]
             n_total = inputs["input_ids"].shape[1]
             log_probs = torch.nn.functional.log_softmax(logits[0], dim=-1)
@@ -278,7 +278,23 @@ class EvalRunner:
         (UnifiedField, FreeEnergyEngine, EpistemicMemory, EpisodicMemory,
         AssociativeMemory, log-lik CausalArena), Broca dynamic SCM injection,
         EnergyCausalArena + TopologyMapper for per-choice causal competition,
-        NGC top-down falsification."""
+        NGC top-down falsification.
+
+        **Bench-specific behavior**: In ``single`` scorer mode (`TENSEGRITY_SCORER` env),
+        :meth:`ScoringBridge.reset` is called **once per benchmark sample**, so episodic /
+        Hopfield state does not accumulate across MC items — each example is isolated.
+
+        In the default canonical mode, reuse a single :class:`CanonicalPipeline` for all
+        samples — per-item hypotheses and SMCs come from ``reset_for_item`` /
+        ``_soft_reset_in_place``. Rebuilding the pipeline on each row would recreate
+        the agent stack and repeatedly load sentence-transformer weights into memory.
+        :meth:`CanonicalPipeline.reset_session` is invoked **once per task**
+        (``EvalRunner.evaluate_task``), wiping cross-task leakage while permitting
+        within-task learning where applicable.
+
+        Prefer ``canonical`` for behavior aligned with HybridPipeline/session semantics;
+        use ``single`` for a deterministic, isolated field snapshot per sample.
+        """
         import os
         import numpy as np
 
@@ -300,11 +316,13 @@ class EvalRunner:
         from tensegrity.pipeline.canonical import CanonicalPipeline
 
         if not hasattr(self, "_canonical"):
-            # use_llm_broca defaults False to avoid LLM calls during MC scoring;
-            # the LLM stays out of the reasoning path. Broca is still reachable
-            # for the chat-mode narration step (HybridPipeline).
+            # One CanonicalPipeline instance for all samples on this Runner. Hypothesis texts
+            # and per-choice SCMs are updated per sample inside ``reset_for_item`` /
+            # ``_soft_reset_in_place``; rebuilding ``CanonicalPipeline`` whenever multi-choice
+            # strings changed would recreate ``TensegrityAgent`` / FHRR SBERT loaders and spam
+            # "Loading weights" for each benchmark row (see CanonicalPipeline docs).
             self._canonical = CanonicalPipeline(
-                hypothesis_labels=list(sample.choices),
+                hypothesis_labels=None,
                 use_llm_broca=False,
                 enable_hypothesis_generation=False,
                 model_name=self.model_name,
@@ -450,8 +468,11 @@ class EvalRunner:
         # doesn't leak priors across tasks (different label spaces).
         if hasattr(self, "_canonical") and hasattr(self._canonical, "reset_session"):
             self._canonical.reset_session()
-        if hasattr(self, "_iter_scorer") and hasattr(self._iter_scorer, "reset_session"):
-            self._iter_scorer.reset_session()
+        if hasattr(self, "_field_scorer"):
+            if hasattr(self._field_scorer, "reset_session"):
+                self._field_scorer.reset_session()
+            elif hasattr(self._field_scorer, "reset"):
+                self._field_scorer.reset()
 
         results = []
         for i, sample in enumerate(samples):

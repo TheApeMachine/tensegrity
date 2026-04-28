@@ -3,8 +3,9 @@
 import warnings
 
 warnings.warn(
-    "tensegrity.core.morton is legacy V1; use tensegrity.legacy.v1.morton "
-    "for the old Morton-coded frontend.",
+    "tensegrity.core.morton is legacy V1; import from tensegrity.legacy.v1.morton "
+    "for the Morton-coded frontend (same API — re-export only). There is no "
+    "alternative module beyond legacy.v1 for this shim.",
     DeprecationWarning,
     stacklevel=2,
 )

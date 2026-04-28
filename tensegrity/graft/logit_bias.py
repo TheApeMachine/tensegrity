@@ -38,6 +38,28 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+
+def _validate_hypothesis_token_scores_weights(
+    hypothesis_token_scores: Optional[Dict[str, Dict[int, float]]],
+    *,
+    context: str,
+) -> None:
+    """``hypothesis_token_scores`` weights must lie in **[0.0, 1.0]** (see graft docstrings)."""
+    if not hypothesis_token_scores:
+        return
+    bad = []
+    for hyp_id, m in hypothesis_token_scores.items():
+        for tid, w in m.items():
+            wf = float(w)
+            if not (0.0 <= wf <= 1.0):
+                bad.append(f"{hyp_id}[{tid}]={wf!r}")
+    if bad:
+        raise ValueError(
+            f"{context}: each hypothesis_token_scores value must be in [0.0, 1.0]; "
+            f"misconfigured entries (showing up to 12): {bad[:12]}"
+        )
+
+
 # Import torch lazily — only needed when actually grafting to a local model
 torch = None
 
@@ -92,8 +114,12 @@ class TensegrityLogitsProcessor:
         """
         Args:
             hypothesis_tokens: {hyp_id: set of token_ids} from VocabularyGrounding
-            hypothesis_token_scores: optional semantic weights per token from
-                      VocabularyGrounding.from_semantic_projection
+            hypothesis_token_scores: optional per-token **weights** in **[0.0, 1.0]**
+                from ``VocabularyGrounding.from_semantic_projection`` (stored on
+                ``VocabularyGrounding.hypothesis_token_scores``).
+                **0.0** applies no incremental bias mass to that token; **1.0** applies the
+                full clamped hypothesis bias ``b`` before per-token stacking. Values outside
+                ``[0.0, 1.0]`` raise ``ValueError`` at processor construction time.
             belief_fn: Callable that returns current posteriors {hyp_id: probability}
                       Sync mode: called each decode step. Async mode: polled in a worker thread.
             vocab_size: LLM vocabulary size
@@ -106,8 +132,6 @@ class TensegrityLogitsProcessor:
             async_beliefs: If True, belief_fn runs in a daemon thread; __call__ is O(1) bias add
             belief_poll_s: Sleep between async polls (seconds)
         """
-        _ensure_torch()
-        
         self.hypothesis_tokens = hypothesis_tokens
         self.hypothesis_token_scores = hypothesis_token_scores or {}
         self.belief_fn = belief_fn
@@ -119,6 +143,11 @@ class TensegrityLogitsProcessor:
         self.max_bias = max_bias
         self.async_beliefs = async_beliefs
         self.belief_poll_s = belief_poll_s
+
+        _validate_hypothesis_token_scores_weights(
+            self.hypothesis_token_scores,
+            context="TensegrityLogitsProcessor",
+        )
         
         # State tracking
         self.state = GraftState()
@@ -243,6 +272,7 @@ class TensegrityLogitsProcessor:
                         if 0 <= tid < self.vocab_size:
                             if not np.isneginf(bias[tid]):
                                 weighted_b = b * float(token_scores.get(tid, 1.0))
+                                weighted_b = max(-self.max_bias, min(self.max_bias, weighted_b))
                                 bias[tid] += weighted_b
                                 if weighted_b > 0:
                                     boosted += 1
@@ -301,6 +331,11 @@ class StaticLogitBiasBuilder:
     Builds a static logit_bias dict from the current belief state.
     Less powerful than the LogitsProcessor (no per-step updates),
     but works with any OpenAI-compatible API.
+
+    ``hypothesis_token_scores`` matches ``TensegrityLogitsProcessor``: optional
+    ``{hyp_id: {token_id: weight}}`` with each **weight** in **[0.0, 1.0]** —
+    cosine-style scores must be scaled before injection (see
+    ``VocabularyGrounding.from_semantic_projection``, which emits [0.0, 1.0] weights).
     """
     
     def __init__(self, hypothesis_tokens: Dict[str, Set[int]],
@@ -313,7 +348,11 @@ class StaticLogitBiasBuilder:
         self.scale = scale
         self.suppress_threshold = suppress_threshold
         self.max_bias = max_bias
-    
+        _validate_hypothesis_token_scores_weights(
+            self.hypothesis_token_scores,
+            context="StaticLogitBiasBuilder",
+        )
+
     def build(self, posteriors: Dict[str, float]) -> Dict[int, float]:
         """
         Build a static logit_bias dict for API calls.
@@ -339,6 +378,7 @@ class StaticLogitBiasBuilder:
                 b = max(-self.max_bias, min(self.max_bias, b))
                 for tid in token_ids:
                     weighted_b = b * float(token_scores.get(tid, 1.0))
+                    weighted_b = max(-self.max_bias, min(self.max_bias, weighted_b))
                     bias[tid] = bias.get(tid, 0.0) + weighted_b
         
         return bias

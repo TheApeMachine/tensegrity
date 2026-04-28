@@ -7,9 +7,13 @@ The primary engine is now the V2 ``UnifiedField`` stack:
     FHRR encoding -> hierarchical predictive coding -> Hopfield memory
     -> optional causal energy terms
 
-Legacy V1 components remain importable from ``tensegrity.legacy.v1``:
-
-    from tensegrity.legacy.v1 import TensegrityAgent, MortonEncoder
+Legacy V1 components (`TensegrityAgent`, `MortonEncoder`, `MarkovBlanket`) remain
+importable from ``tensegrity.legacy.v1``. Several other names are re-exported lazily
+via ``tensegrity`` for migration only: ``EpistemicMemory``, ``EpisodicMemory``, and
+``AssociativeMemory`` from ``tensegrity.memory.*``; ``CausalArena`` and
+``StructuralCausalModel`` from ``tensegrity.causal.*``; ``FreeEnergyEngine`` and
+``BeliefPropagator`` from ``tensegrity.inference.*``. Those are **not** defined under
+``tensegrity.legacy.v1``—use the module paths above when importing explicitly.
 
 Top-level exports intentionally expose the unified field as the default
 architecture. Deprecated V1 names are resolved lazily for migration only.

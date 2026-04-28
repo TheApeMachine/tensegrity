@@ -24,7 +24,12 @@ Mathematical basis:
 """
 
 import numpy as np
+from itertools import product
 from typing import Union, List, Tuple, Optional
+
+
+# Guard against exponential neighborhood enumeration when radius × dims is large.
+MAX_NEIGHBORHOOD_COMBINATIONS = 50_000
 
 
 class MortonEncoder:
@@ -46,16 +51,39 @@ class MortonEncoder:
                     3 for volumetric, N for embeddings)
             bits_per_dim: Resolution per dimension. 10 bits = 1024 levels per dim.
                          Total Morton code space = 2^(n_dims * bits_per_dim)
+                         Must satisfy n_dims * bits_per_dim <= 63 so codes fit np.int64.
             ranges: Min/max per dimension for quantization. If None, auto-calibrated.
         """
         self.n_dims = n_dims
         self.bits_per_dim = bits_per_dim
-        self.total_bits = n_dims * bits_per_dim
+        total_bits = n_dims * bits_per_dim
+        if total_bits > 63:
+            raise ValueError(
+                f"total_bits (n_dims * bits_per_dim) must be <= 63 to fit in np.int64; "
+                f"got total_bits={total_bits}"
+            )
+        self.total_bits = total_bits
         self.levels = 2 ** bits_per_dim
         
         # Quantization ranges per dimension
         if ranges is not None:
-            self.ranges = np.array(ranges, dtype=np.float64)
+            self.ranges = np.asarray(ranges, dtype=np.float64)
+            if self.ranges.ndim != 2 or self.ranges.shape[1] != 2:
+                raise ValueError("ranges must be a sequence of (min, max) tuples per dimension.")
+            spans = self.ranges[:, 1] - self.ranges[:, 0]
+            flat_spans = np.asarray(spans).flatten()
+            bad = np.where(np.abs(flat_spans) < 1e-15)[0]
+            if len(bad):
+                dims_list = [int(i) for i in bad.tolist()]
+                raise ValueError(
+                    "Quantization ranges have zero span on dimension index(es) "
+                    f"{dims_list}; ensure max > min for each dimension "
+                    "(or omit ranges to auto-calibrate from data)."
+                )
+            if int(self.ranges.shape[0]) != int(n_dims):
+                raise ValueError(
+                    f"ranges must have length n_dims ({n_dims}), got shape {self.ranges.shape}."
+                )
         else:
             self.ranges = None  # Will be set on first encode (auto-calibrate)
         
@@ -112,17 +140,24 @@ class MortonEncoder:
         # Normalize to [0, 1] then scale to [0, levels-1]
         mins = self.ranges[:, 0]
         maxs = self.ranges[:, 1]
-        normalized = (values - mins) / (maxs - mins)
+        spans = np.maximum(maxs - mins, 1e-15)
+        normalized = (values - mins) / spans
         normalized = np.clip(normalized, 0.0, 1.0)
         quantized = (normalized * (self.levels - 1)).astype(np.int64)
         return quantized
     
     def dequantize(self, quantized: np.ndarray) -> np.ndarray:
         """Inverse of quantize — reconstruct continuous approximation."""
+        if self.ranges is None:
+            raise ValueError(
+                "ranges not initialized: call encode (or compute_ranges) "
+                "before MortonEncoder.dequantize"
+            )
         mins = self.ranges[:, 0]
         maxs = self.ranges[:, 1]
+        spans = np.maximum(maxs - mins, 1e-15)
         normalized = quantized.astype(np.float64) / (self.levels - 1)
-        return normalized * (maxs - mins) + mins
+        return normalized * spans + mins
     
     def encode(self, values: np.ndarray) -> np.ndarray:
         """
@@ -146,7 +181,16 @@ class MortonEncoder:
         if values.dtype in (np.float32, np.float64):
             quantized = self.quantize(values)
         else:
-            quantized = values.astype(np.int64)
+            quantized = np.asarray(values, dtype=np.int64)
+            qmin = int(np.min(quantized))
+            qmax = int(np.max(quantized))
+            lo = 0
+            hi = int(self.levels - 1)
+            if qmin < lo or qmax > hi:
+                raise ValueError(
+                    f"MortonEncoder.encode expects integer coords in [{lo}, {hi}] "
+                    f"(levels={self.levels}); got range [{qmin}, {qmax}]"
+                )
         
         # Interleave bits for each point
         n_points = quantized.shape[0]
@@ -214,27 +258,32 @@ class MortonEncoder:
     def neighborhood(self, code: int, radius: int = 1) -> List[int]:
         """
         Find Morton codes within a given radius (in quantized coordinates).
-        
-        This exploits the locality property: nearby Morton codes correspond
-        to nearby points in the original space.
+
+        Uses ``decode`` → offset enumeration → ``encode`` within ``[0, levels)``.
         """
-        center = self.decode(code)
-        neighbors = []
-        
-        # Generate all offset combinations within radius
+        decoded = self.decode(code)
+        center = (
+            decoded.reshape(-1).astype(np.int64)
+            if isinstance(decoded, np.ndarray)
+            else np.asarray([decoded], dtype=np.int64)
+        )
+        n_combo = int((2 * radius + 1) ** self.n_dims)
+        if n_combo > MAX_NEIGHBORHOOD_COMBINATIONS:
+            raise ValueError(
+                f"MortonEncoder.neighborhood would enumerate {n_combo} quantized offset "
+                f"combinations (n_dims={self.n_dims}, radius={radius}, levels={self.levels}), "
+                f"which exceeds MAX_NEIGHBORHOOD_COMBINATIONS={MAX_NEIGHBORHOOD_COMBINATIONS}; "
+                "reduce radius or n_dims."
+            )
+
         offsets = range(-radius, radius + 1)
-        
-        def _recurse(dim, current_offset):
-            if dim == self.n_dims:
-                point = center + np.array(current_offset)
-                if np.all(point >= 0) and np.all(point < self.levels):
-                    neighbors.append(int(self.encode(point.reshape(1, -1))))
-                return
-            for off in offsets:
-                _recurse(dim + 1, current_offset + [off])
-        
-        _recurse(0, [])
-        return list(set(neighbors))
+        neighbors: List[int] = []
+        for tup in product(offsets, repeat=self.n_dims):
+            offset = np.array(tup, dtype=np.int64)
+            point = center + offset
+            if np.all(point >= 0) and np.all(point < self.levels):
+                neighbors.append(int(self.encode(point.reshape(1, -1))))
+        return sorted(set(neighbors))
     
     @staticmethod
     def from_modality(modality: str, **kwargs) -> 'MortonEncoder':

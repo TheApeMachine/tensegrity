@@ -9,6 +9,7 @@ Tests:
 """
 
 import numpy as np
+import sys
 import json
 
 np.random.seed(42)

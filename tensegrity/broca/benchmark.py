@@ -240,7 +240,6 @@ def run_tensegrity_agent(scenario: GameScenario, verbose: bool = True) -> Dict[s
 
     for turn in range(len(scenario.clues) + 3):  # Extra turns for questions
         clue = game.get_next_clue()
-    
         if clue is None:
             break
         
@@ -284,7 +283,6 @@ def run_tensegrity_agent(scenario: GameScenario, verbose: bool = True) -> Dict[s
     for h in gold:
         p = gold[h]
         q = agent_probs.get(h, 1e-16)
-    
         if p > 0:
             kl_div += p * np.log(p / max(q, 1e-16))
     

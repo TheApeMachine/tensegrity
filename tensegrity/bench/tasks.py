@@ -435,7 +435,7 @@ def load_task_samples(name: str, max_samples: Optional[int] = None) -> List[Task
 
             samples.append(sample)
         except Exception as e:
-            logger.error(f"Error adapting task {name}: {e}")
+            logger.exception("Error adapting task %s at row %s: %s", name, i, e)
             continue  # Skip malformed rows
 
     return samples

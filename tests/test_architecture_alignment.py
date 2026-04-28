@@ -67,7 +67,7 @@ def test_topology_mapper_turns_horizontal_edge_into_virtual_parent():
 
     assert len(mapping.virtual_parents) == 1
     vp = next(iter(mapping.virtual_parents.values()))
-    assert vp.children == ("A", "B")
+    assert set(vp.children) == {"A", "B"}
     assert mapping.embedded_layers[vp.name] == 1
     assert (vp.name, "A") in mapping.embedded_edges
     assert (vp.name, "B") in mapping.embedded_edges

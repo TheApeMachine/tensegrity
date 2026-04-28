@@ -17,6 +17,7 @@ disagreement) balanced by the free energy principle.
 """
 
 import hashlib
+import inspect
 import numpy as np
 from typing import Optional, Dict, List, Any, Tuple
 import logging
@@ -96,6 +97,41 @@ class TensegrityAgent:
             epistemic_tension_threshold: Only run costly intervention search when causal tension exceeds this level
             epistemic_info_gain_threshold: Minimum estimated information gain required for epistemic actions
         """
+        def _req_pos_int(name: str, v: Any) -> int:
+            if not isinstance(v, int) or int(v) < 1:
+                raise ValueError(f"{name} must be a positive integer")
+            return int(v)
+
+        n_states = _req_pos_int("n_states", n_states)
+        n_observations = _req_pos_int("n_observations", n_observations)
+        n_actions = _req_pos_int("n_actions", n_actions)
+        sensory_dims = _req_pos_int("sensory_dims", sensory_dims)
+        sensory_bits = _req_pos_int("sensory_bits", sensory_bits)
+        context_dim = _req_pos_int("context_dim", context_dim)
+        associative_dim = _req_pos_int("associative_dim", associative_dim)
+        if not isinstance(planning_horizon, int) or planning_horizon < 1:
+            raise ValueError("planning_horizon must be a positive integer")
+        if precision < 0.0:
+            raise ValueError("precision must be non-negative")
+        if zipf_exponent < 0.0:
+            raise ValueError("zipf_exponent must be non-negative")
+        unified_obs_dim = _req_pos_int("unified_obs_dim", unified_obs_dim)
+        if unified_hidden_dims is not None:
+            if not isinstance(unified_hidden_dims, list) or any(
+                not isinstance(x, int) or x < 1 for x in unified_hidden_dims
+            ):
+                raise ValueError("unified_hidden_dims must be a list of positive integers")
+        unified_fhrr_dim = _req_pos_int("unified_fhrr_dim", unified_fhrr_dim)
+        if unified_hopfield_beta < 0.0:
+            raise ValueError("unified_hopfield_beta must be non-negative")
+        unified_ngc_settle_steps = _req_pos_int("unified_ngc_settle_steps", unified_ngc_settle_steps)
+        if unified_ngc_learning_rate < 0.0:
+            raise ValueError("unified_ngc_learning_rate must be non-negative")
+        if not (0.0 <= float(epistemic_tension_threshold) <= 1.0):
+            raise ValueError("epistemic_tension_threshold must be in [0, 1]")
+        if not (0.0 <= float(epistemic_info_gain_threshold) <= 1.0):
+            raise ValueError("epistemic_info_gain_threshold must be in [0, 1]")
+
         self.n_states = n_states
         self.n_obs = n_observations
         self.n_actions = n_actions
@@ -201,7 +237,16 @@ class TensegrityAgent:
         self.arena.register_model(model_b)
     
     def _morton_to_obs_index(self, morton_codes: np.ndarray) -> int:
-        """Map Morton codes to observation index via modular hashing."""
+        """Map Morton codes to a discrete observation index (legacy hashing).
+
+        The main ``perceive`` path fingerprints the unified observation vector
+        with SHA-256 modulo ``n_obs``; use this routine only where an explicit
+        Morton-code → observation-bin mapping is intentional.
+        """
+        if self.n_obs <= 0:
+            raise ValueError(
+                "n_observations must be a positive integer for _morton_to_obs_index mapping"
+            )
         if isinstance(morton_codes, (int, np.integer)):
             return int(morton_codes) % self.n_obs
         # For multiple codes, hash the combination
@@ -342,8 +387,7 @@ class TensegrityAgent:
         
         # Compare epistemic value of experiment vs pragmatic action
         if (experiment is not None and
-            experiment['expected_info_gain'] > self.epistemic_info_gain_threshold and 
-            current_tension >= self.epistemic_tension_threshold):
+                experiment["expected_info_gain"] > self.epistemic_info_gain_threshold):
             # Epistemic action: run an experiment to resolve tension
             return {
                 'type': 'epistemic',
@@ -391,12 +435,10 @@ class TensegrityAgent:
         Weighted by surprise — surprising experiences teach more.
         """
         episodes = self.episodic.replay(n_episodes)
-        
-        total_update = 0.0
+
         for ep in episodes:
             obs_idx = ep.metadata.get('obs_idx', 0)
             self.epistemic.update_likelihood(obs_idx, ep.belief_state)
-            total_update += 1.0
         
         return {
             'episodes_replayed': len(episodes),
@@ -441,8 +483,11 @@ class TensegrityAgent:
     
     @classmethod
     def from_config(cls, config: Dict[str, Any]) -> 'TensegrityAgent':
-        """Create an agent from a configuration dictionary."""
-        return cls(**config)
+        """Create an agent from a configuration dictionary (unknown keys ignored)."""
+        sig = inspect.signature(cls.__init__)
+        allowed = {k for k in sig.parameters if k != "self"}
+        kwargs = {k: v for k, v in config.items() if k in allowed}
+        return cls(**kwargs)
     
     def __repr__(self):
         return (f"TensegrityAgent(states={self.n_states}, obs={self.n_obs}, "

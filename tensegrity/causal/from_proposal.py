@@ -21,8 +21,8 @@ def build_scm_from_proposal(proposal: ProposedSCM, n_values: int = 4) -> Structu
     that edge is dropped (``G.remove_edge``) and a debug log is emitted — earlier edges
     are never removed. Variable order follows a topological sort when the retained graph is non-empty.
     """
-    if n_values <= 0:
-        raise ValueError(f"n_values must be a positive integer, got {n_values}")
+    if not isinstance(n_values, int) or n_values <= 0:
+        raise ValueError(f"n_values must be a positive integer, got {n_values!r}")
 
     G = nx.DiGraph()
 

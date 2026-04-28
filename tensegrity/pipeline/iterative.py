@@ -109,6 +109,10 @@ class IterativeCognitiveScorer:
         # noisy to help. The wiring (encode/retrieve) stays so smarter signals
         # can be plugged in here without re-plumbing.
         w_episodic: float = 0.0,
+        # Minimum cosine match between query and episodic context to trust retrieval.
+        episodic_ctx_sim_threshold: float = 0.5,
+        # Seed for NGC `reinitialize` on `reset`; None chooses a random seed each time.
+        reset_seed: Optional[int] = 12345,
     ):
         from tensegrity.engine.unified_field import UnifiedField
         from tensegrity.memory.episodic import EpisodicMemory
@@ -137,6 +141,8 @@ class IterativeCognitiveScorer:
         self.use_episodic = use_episodic
         self.episodic_top_k = episodic_top_k
         self.w_episodic = w_episodic
+        self.episodic_ctx_sim_threshold = episodic_ctx_sim_threshold
+        self.reset_seed = reset_seed
         # Dirichlet-style per-channel reliability. Each channel accumulates a
         # pseudocount that grows when the channel's top-ranked choice matches
         # the committed belief on an item. Fusion weights = normalized counts.
@@ -165,10 +171,9 @@ class IterativeCognitiveScorer:
 
     def _sbert_similarities(self, prompt: str, choices: List[str]) -> List[float]:
         features = self.field.encoder.features
-        if hasattr(features, "_ensure_sbert") and getattr(features, "_sbert", None) is None:
-            features._ensure_sbert()
-        sbert = getattr(features, "_sbert", None)
-        if sbert is not None and sbert != "FALLBACK":
+        getter = getattr(features, "get_sbert_model", None)
+        sbert = getter() if callable(getter) else None
+        if sbert is not None:
             embs = sbert.encode([prompt] + choices, show_progress_bar=False)
             pe = embs[0]
             pn = float(np.linalg.norm(pe))
@@ -178,7 +183,11 @@ class IterativeCognitiveScorer:
                 cn = float(np.linalg.norm(ce))
                 out.append(float(np.dot(pe, ce) / (pn * cn)) if pn > 1e-8 and cn > 1e-8 else 0.0)
             return out
-        # fallback to FHRR similarity
+        if self.field.encoder.semantic and callable(getter) and not getattr(
+            self, "_sbert_unavailable_logged", False
+        ):
+            logger.warning("SBERT sentence similarity unavailable; using FHRR cosine similarity.")
+            setattr(self, "_sbert_unavailable_logged", True)
         pf = self._encode(self._tokenize(prompt, 64))
         return [
             self.field.encoder.similarity(pf, self._encode(self._tokenize(c, 32)))
@@ -232,7 +241,7 @@ class IterativeCognitiveScorer:
         if self.use_episodic and self.episodic is not None and len(self.episodic.episodes) > 0:
             uniform_belief = np.full(n, 1.0 / n, dtype=np.float64)
             try:
-                query_ctx = self.episodic._compute_item_representation(
+                query_ctx = self.episodic.compute_item_representation(
                     prompt_obs_vec, uniform_belief
                 )
                 retrieved = self.episodic.retrieve_by_context(
@@ -250,13 +259,12 @@ class IterativeCognitiveScorer:
                     ch_real.append(v / nrm if nrm > 1e-10 else v)
                 # Only trust episodes whose prompt context strongly matches.
                 # Below this threshold, "similar past answer" is noise, not signal.
-                CTX_SIM_THRESHOLD = 0.5
                 for ep in retrieved:
                     ans_vec = ep.metadata.get("chosen_fhrr_real") if ep.metadata else None
                     if ans_vec is None:
                         continue
                     ctx_sim = float(np.dot(query_ctx, ep.context_vector))
-                    if ctx_sim < CTX_SIM_THRESHOLD:
+                    if ctx_sim < self.episodic_ctx_sim_threshold:
                         continue
                     # Also discount by past surprise: episodes the agent struggled
                     # with (low committed confidence) carry less authority.
@@ -275,6 +283,10 @@ class IterativeCognitiveScorer:
         converged = False
         iterations_used = 0
         last_channel_scores: Dict[str, np.ndarray] = {}
+
+        def znorm(a: np.ndarray) -> np.ndarray:
+            s = a.std()
+            return (a - a.mean()) / s if s > 1e-10 else np.zeros_like(a)
 
         for it in range(self.max_iterations):
             iterations_used = it + 1
@@ -316,10 +328,6 @@ class IterativeCognitiveScorer:
                         hop_bonus[i] = float(np.dot(q, retrieved / rn))
 
             # 3b. Fuse z-normalized
-            def znorm(a: np.ndarray) -> np.ndarray:
-                s = a.std()
-                return (a - a.mean()) / s if s > 1e-10 else np.zeros_like(a)
-
             # Normalized channel weights from accumulated reliability counts.
             total = sum(self._channel_counts.values())
             w = {c: self._channel_counts[c] / total for c in self._channels}
@@ -362,11 +370,6 @@ class IterativeCognitiveScorer:
             self.field.ngc.settle(prompt_obs_vec, steps=self.context_settle_steps)
             self.field.ngc.learn(modulation=self.shaping_lr_scale)
 
-            # 3e. Hopfield: store the *prompt* encoding so cross-iteration memory
-            # accumulates evidence about the question, not the current guess.
-            if self.use_hopfield:
-                self.field.memory.store(self._encode(prompt_tokens))
-
             # Re-base on the prompt-grounded state for next iteration's scoring
             base_state = self.field.ngc.save_state()
 
@@ -376,6 +379,10 @@ class IterativeCognitiveScorer:
             if top_p >= self.convergence_top_p or db < self.convergence_delta:
                 converged = True
                 break
+
+        # Store prompt encoding once for Hopfield cross-item memory (not each iteration).
+        if self.use_hopfield:
+            self.field.memory.store(self._encode(prompt_tokens))
 
         committed_idx = int(np.argmax(prev_belief))
 
@@ -435,8 +442,16 @@ class IterativeCognitiveScorer:
     def reset(self):
         """Per-item reset. Clears NGC working state but PRESERVES Hopfield
         patterns and episodic memory — those carry across items in a session
-        and provide cross-item learning."""
-        self.field.ngc.reinitialize(12345)
+        and provide cross-item learning.
+
+        NGC weights are reinitialized using ``reset_seed``: default ``12345``
+        matches legacy behavior for reproducibility; pass ``None`` for a random
+        seed each reset, or any other integer to pin runs.
+        """
+        seed = self.reset_seed
+        if seed is None:
+            seed = int(np.random.randint(0, 2 ** 31))
+        self.field.ngc.reinitialize(seed)
         self.field.energy_history.clear()
         self.field._step_count = 0
 
@@ -444,9 +459,7 @@ class IterativeCognitiveScorer:
         """Full reset. Use at task / session boundaries to clear all memory
         and per-channel reliability priors (which are task-specific)."""
         self.reset()
-        self.field.memory.patterns.clear()
-        self.field.memory._matrix = None
-        self.field.memory._dirty = True
+        self.field.memory.clear()
         if self.episodic is not None:
             self.episodic.clear()
         for c in self._channels:

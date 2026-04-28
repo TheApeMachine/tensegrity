@@ -8,6 +8,7 @@ from __future__ import annotations
 import time
 import argparse
 import logging
+import warnings
 
 import numpy as np
 
@@ -34,23 +35,32 @@ def run_task(task_name: str, n: int):
         print(f"  [{task_name}] no samples")
         return None
 
+    shared_params = {
+        "obs_dim": 256,
+        "hidden_dims": [128, 32],
+        "fhrr_dim": 2048,
+        "ngc_settle_steps": 30,
+        "ngc_learning_rate": 0.01,
+        "hopfield_beta": 0.05,
+        "context_settle_steps": 40,
+        "choice_settle_steps": 25,
+        "context_learning_epochs": 3,
+    }
     single = ScoringBridge(
-        obs_dim=256, hidden_dims=[128, 32], fhrr_dim=2048,
-        ngc_settle_steps=30, ngc_learning_rate=0.01,
-        hopfield_beta=0.05, confidence_threshold=0.15,
-        context_settle_steps=40, choice_settle_steps=25,
-        context_learning_epochs=3,
+        **shared_params,
+        confidence_threshold=0.15,
     )
     iterative = IterativeCognitiveScorer(
-        obs_dim=256, hidden_dims=[128, 32], fhrr_dim=2048,
-        ngc_settle_steps=30, ngc_learning_rate=0.01,
-        hopfield_beta=0.05,
-        max_iterations=6, convergence_top_p=0.75,
-        context_settle_steps=40, choice_settle_steps=25,
-        context_learning_epochs=3,
-        w_sbert=1.0, w_fhrr=0.3, w_ngc=0.6,
-        belief_step=0.6, shaping_lr_scale=0.5,
-        use_hopfield=True, hopfield_steps=2,
+        **shared_params,
+        max_iterations=6,
+        convergence_top_p=0.75,
+        w_sbert=1.0,
+        w_fhrr=0.3,
+        w_ngc=0.6,
+        belief_step=0.6,
+        shaping_lr_scale=0.5,
+        use_hopfield=True,
+        hopfield_steps=2,
     )
 
     n_total = len(samples)
@@ -75,7 +85,21 @@ def run_task(task_name: str, n: int):
         sa = np.array(scores_s)
         if np.allclose(sa, 0.0):
             # use raw sbert sim as tiebreaker (single's gate = uninformative)
-            sims = single._sentence_similarities(s.prompt, s.choices)
+            if hasattr(single, "sentence_similarities"):
+                sims = single.sentence_similarities(s.prompt, s.choices)
+            elif hasattr(single, "_sentence_similarities"):
+                warnings.warn(
+                    "ScoringBridge has no public sentence_similarities(); using "
+                    "_sentence_similarities (private). Prefer adding a stable public API.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+                sims = single._sentence_similarities(s.prompt, s.choices)
+            else:
+                raise AttributeError(
+                    "ScoringBridge exposes no sentence_similarities() or "
+                    "_sentence_similarities(); add a public API on ScoringBridge for tie-breaks.",
+                )
             pred_s = int(np.argmax(sims))
         else:
             pred_s = int(np.argmax(sa))

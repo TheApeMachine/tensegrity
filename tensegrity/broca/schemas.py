@@ -177,6 +177,7 @@ class Utterance(BaseModel):
     style_register: Literal["formal", "casual", "technical", "empathetic"] = Field(
         default="casual",
         alias="register",
+        serialization_alias="register",
     )
 
 

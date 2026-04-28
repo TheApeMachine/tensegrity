@@ -25,7 +25,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from typing import Dict, List
+import traceback
 
 from tensegrity.graft.pipeline import HybridPipeline
 
@@ -141,7 +141,6 @@ def main():
         try:
             pipe.process_observation(line)
         except Exception as e:
-            import traceback
             print(f"[perception failed: {type(e).__name__}: {e}]")
             traceback.print_exc()
             continue
@@ -154,7 +153,6 @@ def main():
                 max_tokens=100,
             )
         except Exception as e:
-            import traceback
             print(f"[generation failed: {type(e).__name__}: {e}]")
             traceback.print_exc()
             continue
