@@ -30,6 +30,7 @@ The graft implements three principles from the manifold integration:
 """
 
 import math
+import threading
 import numpy as np
 from typing import Dict, List, Optional, Set, Callable, Any
 from dataclasses import dataclass
@@ -84,12 +85,14 @@ class TensegrityLogitsProcessor:
                  suppress_threshold: float = 0.01,
                  entropy_gate: float = 0.85,
                  min_confidence: float = 0.3,
-                 max_bias: float = 8.0):
+                 max_bias: float = 8.0,
+                 async_beliefs: bool = False,
+                 belief_poll_s: float = 0.005):
         """
         Args:
             hypothesis_tokens: {hyp_id: set of token_ids} from VocabularyGrounding
             belief_fn: Callable that returns current posteriors {hyp_id: probability}
-                      This is called at EVERY decode step — must return fresh state.
+                      Sync mode: called each decode step. Async mode: polled in a worker thread.
             vocab_size: LLM vocabulary size
             scale: γ — guidance strength. 0=off, 2.5=moderate, 5.0=strong
             suppress_threshold: P below this → hard -inf suppress
@@ -97,6 +100,8 @@ class TensegrityLogitsProcessor:
                          1.0 = always emit, 0.0 = never emit, 0.85 = emit when fairly certain
             min_confidence: Minimum max-posterior probability to emit any bias
             max_bias: Clamp bias magnitude to prevent numerical issues
+            async_beliefs: If True, belief_fn runs in a daemon thread; __call__ is O(1) bias add
+            belief_poll_s: Sleep between async polls (seconds)
         """
         _ensure_torch()
         
@@ -108,10 +113,20 @@ class TensegrityLogitsProcessor:
         self.entropy_gate = entropy_gate
         self.min_confidence = min_confidence
         self.max_bias = max_bias
+        self.async_beliefs = async_beliefs
+        self.belief_poll_s = belief_poll_s
         
         # State tracking
         self.state = GraftState()
         self._step_count = 0
+        
+        self._bias_lock = threading.Lock()
+        self._latest_bias_np: Optional[np.ndarray] = None
+        self._stop_worker = threading.Event()
+        self._worker: Optional[threading.Thread] = None
+        if self.async_beliefs:
+            self._worker = threading.Thread(target=self._async_belief_worker, daemon=True)
+            self._worker.start()
     
     def _compute_entropy(self, posteriors: Dict[str, float]) -> float:
         """Normalized entropy of the posterior. 0=resolved, 1=uniform."""
@@ -142,6 +157,73 @@ class TensegrityLogitsProcessor:
         
         return self.state.convergence_met
     
+    def close(self):
+        """Stop the background belief worker (async mode)."""
+        self._stop_worker.set()
+        if self._worker is not None:
+            self._worker.join(timeout=2.0)
+            self._worker = None
+    
+    def _async_belief_worker(self):
+        while not self._stop_worker.is_set():
+            try:
+                posteriors = self.belief_fn()
+                bias_np = self._compute_bias_numpy(posteriors)
+            except Exception as e:
+                logger.debug("Async belief worker error: %s", e)
+                bias_np = None
+            with self._bias_lock:
+                self._latest_bias_np = bias_np
+            self._stop_worker.wait(self.belief_poll_s)
+    
+    def _compute_bias_numpy(self, posteriors: Dict[str, float]) -> Optional[np.ndarray]:
+        """Build vocab-sized bias vector on CPU, or None if gated off."""
+        if not posteriors:
+            self.state.bias_emitted = False
+            return None
+        if not self._should_emit(posteriors):
+            self.state.bias_emitted = False
+            return None
+        
+        N = len(posteriors)
+        p_uniform = 1.0 / N
+        bias = np.zeros(self.vocab_size, dtype=np.float64)
+        boosted = 0
+        suppressed = 0
+        max_mag = 0.0
+        
+        for hyp_id, prob in posteriors.items():
+            token_ids = self.hypothesis_tokens.get(hyp_id, set())
+            if not token_ids:
+                continue
+            
+            if prob < self.suppress_threshold:
+                for tid in token_ids:
+                    if 0 <= tid < self.vocab_size:
+                        bias[tid] = -np.inf
+                        suppressed += 1
+            else:
+                b = self.scale * math.log(prob / p_uniform)
+                b = max(-self.max_bias, min(self.max_bias, b))
+                for tid in token_ids:
+                    if 0 <= tid < self.vocab_size:
+                        if not np.isneginf(bias[tid]):
+                            bias[tid] += b
+                            if b > 0:
+                                boosted += 1
+                            max_mag = max(max_mag, abs(b))
+        
+        max_prob = max(posteriors.values())
+        confidence_scale = (max_prob - p_uniform) / (1.0 - p_uniform) if max_prob > p_uniform else 0.0
+        finite = np.isfinite(bias)
+        bias[finite] *= confidence_scale
+        
+        self.state.bias_emitted = True
+        self.state.max_bias_magnitude = max_mag * confidence_scale
+        self.state.boosted_tokens = boosted
+        self.state.suppressed_tokens = suppressed
+        return bias
+    
     def __call__(self, input_ids, scores):
         """
         Called at every decode step by model.generate().
@@ -156,67 +238,19 @@ class TensegrityLogitsProcessor:
         self._step_count += 1
         self.state.step = self._step_count
         
-        # Read current beliefs from Tensegrity
-        posteriors = self.belief_fn()
+        if self.async_beliefs:
+            with self._bias_lock:
+                bias_np = None if self._latest_bias_np is None else self._latest_bias_np.copy()
+        else:
+            posteriors = self.belief_fn()
+            bias_np = self._compute_bias_numpy(posteriors)
         
-        if not posteriors:
+        if bias_np is None:
             self.state.bias_emitted = False
             return scores
         
-        # Convergence gate
-        if not self._should_emit(posteriors):
-            self.state.bias_emitted = False
-            return scores
-        
-        # Compute bias
-        N = len(posteriors)
-        p_uniform = 1.0 / N
-        
-        bias = torch.zeros(self.vocab_size, device=scores.device, dtype=scores.dtype)
-        boosted = 0
-        suppressed = 0
-        max_mag = 0.0
-        
-        for hyp_id, prob in posteriors.items():
-            token_ids = self.hypothesis_tokens.get(hyp_id, set())
-            if not token_ids:
-                continue
-            
-            if prob < self.suppress_threshold:
-                # Hard suppress — eliminated hypothesis
-                b = float('-inf')
-                for tid in token_ids:
-                    if 0 <= tid < self.vocab_size:
-                        bias[tid] = float('-inf')
-                        suppressed += 1
-            else:
-                # Log-ratio bias: positive when prob > uniform, negative when below
-                b = self.scale * math.log(prob / p_uniform)
-                b = max(-self.max_bias, min(self.max_bias, b))  # Clamp
-                
-                for tid in token_ids:
-                    if 0 <= tid < self.vocab_size:
-                        if bias[tid] != float('-inf'):  # Don't un-suppress
-                            bias[tid] += b
-                            if b > 0:
-                                boosted += 1
-                            max_mag = max(max_mag, abs(b))
-        
-        # Scale by confidence — uncertain beliefs emit weaker biases
-        max_prob = max(posteriors.values())
-        confidence_scale = (max_prob - p_uniform) / (1.0 - p_uniform) if max_prob > p_uniform else 0.0
-        
-        # Apply confidence scaling to non-inf biases
-        finite_mask = bias != float('-inf')
-        bias[finite_mask] *= confidence_scale
-        
-        # Update state
-        self.state.bias_emitted = True
-        self.state.max_bias_magnitude = max_mag * confidence_scale
-        self.state.boosted_tokens = boosted
-        self.state.suppressed_tokens = suppressed
-        
-        return scores + bias.unsqueeze(0)  # Broadcast over batch dim
+        bias = torch.tensor(bias_np, device=scores.device, dtype=scores.dtype)
+        return scores + bias.unsqueeze(0)
 
 
 class StaticLogitBiasBuilder:

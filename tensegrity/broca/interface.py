@@ -17,7 +17,7 @@ data that doesn't match the schema.
 import os
 import json
 import logging
-from typing import Optional, Type, TypeVar, Union
+from typing import Optional, Type, TypeVar, Union, List
 
 from pydantic import BaseModel
 
@@ -28,6 +28,7 @@ from tensegrity.broca.schemas import (
     QuestionUtterance,
     BeliefState,
     CognitiveAction,
+    ProposedSCM,
 )
 
 logger = logging.getLogger(__name__)
@@ -132,9 +133,12 @@ class BrocaInterface:
             ParsedObservation with typed fields
         """
         system_prompt = (
-            "You are a linguistic parser. Extract structured information from the input. "
-            "Do NOT interpret, evaluate, reason about, or add to the content. "
-            "Extract only what is explicitly stated. "
+            "You are a linguistic parser. Extract structured information from the input.\n"
+            "relations: predicates that are DIRECTLY stated in the text.\n"
+            "implicit_relations: the SAME RelationMention shape for links that are NOT quoted "
+            "but are logically required for the scenario to hold (commonsense bridges only). "
+            "Keep implicit_relations sparse; do not invent unrelated facts.\n"
+            "Do NOT output prose reasoning — only typed fields. "
             "If something is unclear, set confidence_linguistic lower."
         )
         if context:
@@ -147,6 +151,34 @@ class BrocaInterface:
         
         self._parse_calls += 1
         return self._call_llm(messages, ParsedObservation, self.max_parse_tokens)
+    
+    def propose_causal_hypothesis(
+        self,
+        situation_summary: str,
+        existing_model_names: List[str],
+    ) -> ProposedSCM:
+        """
+        Propose a new structural causal model when existing SCMs fit poorly.
+
+        Returns a bounded DAG schema only (no free-form reasoning).
+        """
+        system_prompt = (
+            "You are a causal model designer. Propose ONE small directed acyclic graph "
+            "as variable names and typed edges (causes / prevents / enables). "
+            "Use short snake_case identifiers. At most 12 edges. "
+            "Name must differ from existing model names. Output only the schema fields."
+        )
+        existing = ", ".join(existing_model_names[:24]) if existing_model_names else "(none)"
+        user_content = (
+            f"Existing models: {existing}\n\n"
+            f"Observations / situation:\n{situation_summary[:2400]}"
+        )
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content},
+        ]
+        self._parse_calls += 1
+        return self._call_llm(messages, ProposedSCM, self.max_parse_tokens)
     
     def parse_feedback(self, feedback: str, 
                        action_taken: str,

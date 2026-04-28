@@ -68,8 +68,14 @@ class PredictiveCodingCircuit:
                  tau: float = 1.0,
                  gamma: float = 0.01,
                  settle_steps: int = 20,
+                 settle_steps_warm: int = 5,
+                 obs_change_threshold: float = 1e-2,
                  learning_rate: float = 0.01,
-                 activation: str = "tanh"):
+                 activation: str = "tanh",
+                 adaptive_precision: bool = True,
+                 precision_momentum: float = 0.9,
+                 precision_min: float = 0.1,
+                 precision_max: float = 100.0):
         """
         Args:
             layer_sizes: [dim_sensory, dim_hidden1, ..., dim_top]
@@ -79,15 +85,26 @@ class PredictiveCodingCircuit:
             tau: Membrane time constant (settling speed)
             gamma: State decay rate (leaky integration)
             settle_steps: How many steps to run before declaring convergence
+            settle_steps_warm: Steps when the observation is nearly unchanged (warm-started z)
+            obs_change_threshold: L2 change above this triggers full settle_steps
             learning_rate: Hebbian learning rate for synaptic updates
             activation: Nonlinearity: "tanh", "relu", "sigmoid", or "linear"
+            adaptive_precision: If True, update precisions from prediction-error variance in learn()
+            precision_momentum: EMA factor for precision updates (higher = slower change)
+            precision_min / precision_max: Clamp learned precisions
         """
         self.n_layers = len(layer_sizes)
         self.layer_sizes = layer_sizes
         self.tau = tau
         self.gamma = gamma
         self.settle_steps = settle_steps
+        self.settle_steps_warm = max(1, int(settle_steps_warm))
+        self.obs_change_threshold = obs_change_threshold
         self.lr = learning_rate
+        self.adaptive_precision = adaptive_precision
+        self.precision_momentum = precision_momentum
+        self.precision_min = precision_min
+        self.precision_max = precision_max
         
         # Activation function
         self._phi, self._phi_deriv = self._get_activation(activation)
@@ -123,6 +140,9 @@ class PredictiveCodingCircuit:
         # Energy tracking
         self.energy_history: List[float] = []
         self.error_history: List[List[float]] = []  # Per-layer error norms
+        
+        # Warm-start: last observation for change detection
+        self._last_obs: Optional[np.ndarray] = None
     
     def _get_activation(self, name: str):
         """Get activation function and its derivative."""
@@ -206,12 +226,6 @@ class PredictiveCodingCircuit:
         Returns:
             Settling diagnostics
         """
-        n_steps = steps or self.settle_steps
-        
-        if not self._initialized:
-            self._init_layers(observation)
-        
-        # Clamp sensory layer
         obs = np.asarray(observation, dtype=np.float64)
         if len(obs) != self.layer_sizes[0]:
             # Project to sensory dimension
@@ -222,6 +236,25 @@ class PredictiveCodingCircuit:
                 padded[:len(obs)] = obs
                 obs = padded
         
+        obs_changed = True
+        if self._last_obs is not None and self._last_obs.shape == obs.shape:
+            if float(np.linalg.norm(obs - self._last_obs)) <= self.obs_change_threshold:
+                obs_changed = False
+        self._last_obs = obs.copy()
+        
+        if steps is not None:
+            n_steps = steps
+        elif not self._initialized:
+            n_steps = self.settle_steps
+        elif obs_changed:
+            n_steps = self.settle_steps
+        else:
+            n_steps = self.settle_steps_warm
+        
+        if not self._initialized:
+            self._init_layers(obs)
+        
+        # Clamp sensory layer
         self.layers[0].z = obs.copy()
         
         energy_trace = []
@@ -294,6 +327,17 @@ class PredictiveCodingCircuit:
         confidence that this observation is trustworthy.
         """
         effective_lr = self.lr * modulation
+        
+        if self.adaptive_precision and self.layers:
+            for ell in range(self.n_layers):
+                sq_error = float(np.mean(self.layers[ell].error ** 2))
+                target_precision = 1.0 / max(sq_error, 1e-6)
+                mom = self.precision_momentum
+                self.precisions[ell] = mom * self.precisions[ell] + (1.0 - mom) * target_precision
+                self.precisions[ell] = float(
+                    np.clip(self.precisions[ell], self.precision_min, self.precision_max)
+                )
+                self.layers[ell].precision = self.precisions[ell]
         
         for ell in range(self.n_layers - 1):
             error_below = self.layers[ell].error

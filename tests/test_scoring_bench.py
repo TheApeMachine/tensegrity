@@ -1,5 +1,5 @@
 """
-Test v2 scoring bridge against benchmarks.
+Integration tests: ScoringBridge on benchmark samples and energy causal arena.
 """
 import sys
 sys.path.insert(0, '/app')
@@ -7,16 +7,16 @@ import numpy as np
 np.random.seed(42)
 
 
-def test_v2_scoring():
-    """Test v2 NGC-based scoring on benchmark samples."""
+def test_scoring_bridge_on_tasks():
+    """ScoringBridge on a small slice of benchmark tasks."""
     print("=" * 60)
-    print("TEST: v2 NGC Scoring vs v1 Baseline on Sample Tasks")
+    print("TEST: semantic field scoring on sample tasks")
     print("=" * 60)
     
-    from tensegrity.v2.graft import V2ScoringBridge
+    from tensegrity.engine.scoring import ScoringBridge
     from tensegrity.bench.tasks import load_task_samples
     
-    bridge = V2ScoringBridge(obs_dim=128, hidden_dims=[64, 16])
+    bridge = ScoringBridge(obs_dim=128, hidden_dims=[64, 16])
     
     tasks = ["copa", "sciq", "arc_challenge"]
     
@@ -41,18 +41,18 @@ def test_v2_scoring():
         acc = correct / max(total, 1)
         print(f"\n  {task_name}: {correct}/{total} = {acc:.1%}")
     
-    print(f"\n  ✓ v2 scoring bridge functional")
+    print(f"\n  ✓ ScoringBridge functional")
     return True
 
 
-def test_causal_energy():
-    """Test the causal energy term."""
+def test_causal_energy_arena():
+    """Energy-based causal model competition."""
     print("\n" + "=" * 60)
-    print("TEST: Causal Energy Arena v2")
+    print("TEST: energy-based causal arena")
     print("=" * 60)
     
     from tensegrity.causal.scm import StructuralCausalModel
-    from tensegrity.v2.causal_energy import CausalArenaV2
+    from tensegrity.engine.causal_energy import EnergyCausalArena
     
     # Two competing models
     m_correct = StructuralCausalModel("correct")
@@ -68,7 +68,7 @@ def test_causal_energy():
     m_correct.update_from_data(data)
     m_wrong.update_from_data(data)
     
-    arena = CausalArenaV2(precision=1.0, beta=2.0)
+    arena = EnergyCausalArena(precision=1.0, beta=2.0)
     arena.register(m_correct)
     arena.register(m_wrong)
     
@@ -89,18 +89,18 @@ def test_causal_energy():
     print(f"  Last energies: {last_result['energies']}")
     print(f"  Last posteriors: {last_result['posteriors']}")
     
-    print(f"  ✓ Causal energy arena functional")
+    print(f"  ✓ Energy causal arena functional")
     return True
 
 
 if __name__ == "__main__":
     tests = [
-        ("v2 Scoring", test_v2_scoring),
-        ("Causal Energy", test_causal_energy),
+        ("Scoring bridge", test_scoring_bridge_on_tasks),
+        ("Causal energy", test_causal_energy_arena),
     ]
     
     print("\n" + "█" * 60)
-    print("  v2 Integration Tests")
+    print("  Scoring + causal energy integration")
     print("█" * 60)
     
     for name, fn in tests:

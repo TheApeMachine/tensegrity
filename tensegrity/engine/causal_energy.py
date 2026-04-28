@@ -10,13 +10,8 @@ Where:
     pa(v) = parents of v in the causal DAG
 
 Multiple SCMs compete. The model with lowest causal energy provides
-the best explanation. This replaces the v1 causal arena's log-likelihood
-comparison with a unified energy-based comparison.
-
-The causal energy connects to the NGC energy through shared variables:
-if a causal variable maps to an NGC layer's abstract state, then the
-NGC prediction error and the causal prediction error are literally
-the same quantity at different scales of description.
+the best explanation. This complements the log-likelihood CausalArena in ``tensegrity.causal.arena``
+when an energy-based readout of SCM fit is required.
 """
 
 import numpy as np
@@ -81,18 +76,9 @@ class CausalEnergyTerm:
         return mech.cpt[:, config_idx]
 
 
-class CausalArenaV2:
+class EnergyCausalArena:
     """
-    v2 causal arena: SCMs compete via energy, not log-likelihood.
-    
-    Each model is wrapped in a CausalEnergyTerm. The model with
-    lowest energy wins. The tension is the ratio of energies
-    (or equivalently, the softmax distribution over models).
-    
-    This integrates with the unified energy landscape:
-      E_total = E_perception(NGC) + E_memory(Hopfield) + E_causal(arena)
-    
-    Where E_causal = min_k E_causal(M_k) — we use the best model's energy.
+    SCMs compete via prediction-error energy. Lowest energy wins.
     """
     
     def __init__(self, precision: float = 1.0, beta: float = 1.0):

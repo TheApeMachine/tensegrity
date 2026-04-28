@@ -96,6 +96,15 @@ class EpisodicMemory:
         
         self._timestep = 0
     
+    def clear(self):
+        """Reset store for a new independent episode (e.g. next benchmark item)."""
+        self.context = np.random.randn(self.context_dim)
+        self.context /= np.linalg.norm(self.context)
+        self.episodes.clear()
+        self._morton_index.clear()
+        self._surprise_heap.clear()
+        self._timestep = 0
+    
     def _compute_item_representation(self, observation: np.ndarray,
                                      belief_state: np.ndarray) -> np.ndarray:
         """

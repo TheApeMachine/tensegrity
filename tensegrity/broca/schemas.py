@@ -43,6 +43,20 @@ class RelationMention(BaseModel):
     negated: bool = False
 
 
+class CausalEdge(BaseModel):
+    """One edge in a proposed structural causal model (SCM)."""
+    source: str = Field(description="Cause or enabling variable name")
+    target: str = Field(description="Effect variable name")
+    mechanism: Literal["causes", "prevents", "enables"]
+
+
+class ProposedSCM(BaseModel):
+    """LLM-proposed SCM as a named DAG plus short description."""
+    name: str = Field(max_length=64, description="Short identifier, suitable for SCM.name")
+    description: str = Field(max_length=512, description="One sentence: what this model claims")
+    edges: List[CausalEdge] = Field(max_length=48, description="Directed edges; must be acyclic")
+
+
 class ParsedObservation(BaseModel):
     """
     Schema for LLM-as-parser: convert natural language into structured observation.
@@ -51,6 +65,13 @@ class ParsedObservation(BaseModel):
     """
     entities: List[EntityMention] = Field(default_factory=list)
     relations: List[RelationMention] = Field(default_factory=list)
+    implicit_relations: List[RelationMention] = Field(
+        default_factory=list,
+        description=(
+            "Typed implications required for consistency with the text but not literally stated; "
+            "use closed predicates only (same vocabulary as relations)."
+        ),
+    )
     is_question: bool = Field(description="Is the input asking for information?")
     is_assertion: bool = Field(description="Is the input stating a fact/claim?")
     is_command: bool = Field(description="Is the input requesting an action?")

@@ -50,8 +50,9 @@ class HybridPipeline:
                  model_name: str = "meta-llama/Llama-3.2-1B-Instruct",
                  mode: str = "local",
                  scale: float = 2.5,
-                 entropy_gate: float = 0.85,
-                 suppress_threshold: float = 0.01):
+        entropy_gate: float = 0.85,
+        suppress_threshold: float = 0.01,
+        async_graft: bool = True):
         """
         Args:
             hypothesis_labels: List of hypothesis names
@@ -64,6 +65,7 @@ class HybridPipeline:
             scale: Logit bias magnitude
             entropy_gate: Convergence threshold for bias emission
             suppress_threshold: Below this probability → hard suppress
+            async_graft: Local mode only — poll beliefs in a background thread for non-blocking decode
         """
         self.hypothesis_labels = hypothesis_labels
         self.model_name = model_name
@@ -71,6 +73,7 @@ class HybridPipeline:
         self.scale = scale
         self.entropy_gate = entropy_gate
         self.suppress_threshold = suppress_threshold
+        self.async_graft = async_graft
         
         # Initialize cognitive controller (template mode — no LLM for parsing)
         self.controller = CognitiveController(
@@ -125,6 +128,7 @@ class HybridPipeline:
             scale=self.scale,
             suppress_threshold=self.suppress_threshold,
             entropy_gate=self.entropy_gate,
+            async_beliefs=self.async_graft,
         )
         
         logger.info(f"Vocabulary grounding coverage: {self._grounding.coverage()}")

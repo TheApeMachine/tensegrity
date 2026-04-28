@@ -31,10 +31,14 @@ from tensegrity.broca.schemas import (
     BeliefState,
     CognitiveAction,
     Hypothesis,
+    RelationMention,
 )
 from tensegrity.broca.interface import BrocaInterface
+from tensegrity.causal.from_proposal import build_scm_from_proposal
 
 logger = logging.getLogger(__name__)
+
+IMPLICIT_RELATION_WEIGHT = 0.3
 
 
 class CognitiveController:
@@ -60,7 +64,8 @@ class CognitiveController:
                  broca: Optional[BrocaInterface] = None,
                  n_hypotheses: int = 8,
                  hypothesis_labels: Optional[List[str]] = None,
-                 use_llm: bool = True):
+                 use_llm: bool = True,
+                 enable_hypothesis_generation: bool = False):
         """
         Args:
             agent: TensegrityAgent instance. Created with defaults if None.
@@ -68,8 +73,10 @@ class CognitiveController:
             n_hypotheses: Number of competing hypotheses to maintain
             hypothesis_labels: Labels for the hypothesis space
             use_llm: If False, uses template-based parse/produce (for testing without API)
+            enable_hypothesis_generation: If True and use_llm, may add LLM-proposed SCMs when tension is high
         """
         self.use_llm = use_llm
+        self.enable_hypothesis_generation = enable_hypothesis_generation
         
         # Cognitive substrate
         n_states = n_hypotheses
@@ -121,6 +128,88 @@ class CognitiveController:
             3: "state_conclusion",
         }
     
+    def reset_session(self, hypothesis_labels: List[str]) -> None:
+        """
+        Start a fresh session for an independent item (e.g. one benchmark sample).
+
+        Rebuilds the substrate agent with dimensions matched to the hypothesis
+        count and clears conversational artifacts.
+        """
+        labels = list(hypothesis_labels)
+        if not labels:
+            labels = ["_empty_"]
+        n_hyp = max(len(labels), 2)
+        self.agent = TensegrityAgent(
+            n_states=n_hyp,
+            n_observations=n_hyp * 4,
+            n_actions=4,
+            sensory_dims=n_hyp,
+            sensory_bits=4,
+            context_dim=32,
+            associative_dim=64,
+            planning_horizon=2,
+            precision=4.0,
+        )
+        self.belief_state = BeliefState(
+            turn=0,
+            hypotheses=[],
+            eliminated_hypotheses=[],
+            confirmed_facts=[],
+            open_questions=[],
+            current_tension=1.0,
+            epistemic_urgency=1.0,
+            free_energy=0.0,
+        )
+        self._init_hypotheses(labels)
+        self._conversation.clear()
+    
+    def perceive_only(self, input_text: str) -> Dict[str, Any]:
+        """
+        Parse and run perception + belief update only (no action / no verbalization).
+        """
+        self.belief_state.turn += 1
+        if self.use_llm and self.broca:
+            parsed = self.broca.parse(input_text, context=self._get_parse_context())
+        else:
+            parsed = self._template_parse(input_text)
+        obs_vector = self._observation_to_vector(parsed)
+        perception = self.agent.perceive(obs_vector)
+        self._maybe_inject_causal_hypothesis(perception, input_text)
+        self._update_hypotheses_from_inference(perception, obs_vector)
+        for entity in parsed.entities:
+            fact = (
+                f"[T{self.belief_state.turn}] Observed: {entity.normalized} "
+                f"({entity.entity_type})"
+            )
+            self.belief_state.confirmed_facts.append(fact)
+        for relation in parsed.relations:
+            fact = (
+                f"[T{self.belief_state.turn}] {relation.subject} "
+                f"{relation.predicate} {relation.object}"
+            )
+            if relation.negated:
+                fact = f"NOT({fact})"
+            self.belief_state.confirmed_facts.append(fact)
+        for relation in parsed.implicit_relations:
+            fact = (
+                f"[T{self.belief_state.turn}] (implicit) {relation.subject} "
+                f"{relation.predicate} {relation.object}"
+            )
+            if relation.negated:
+                fact = f"NOT({fact})"
+            self.belief_state.confirmed_facts.append(fact)
+        return {
+            "perception": {
+                "free_energy": perception["free_energy"],
+                "surprise": perception["surprise"],
+                "tension": perception["arena"]["tension"],
+                "epistemic_value": perception["epistemic_value"],
+            },
+            "belief_state": self.belief_state.model_dump(),
+            "parsed_input": parsed.model_dump(),
+            "turn": self.belief_state.turn,
+        }
+    
     def _init_hypotheses(self, labels: List[str]):
         """Initialize the hypothesis space with uniform priors."""
         n = len(labels)
@@ -134,6 +223,63 @@ class CognitiveController:
             )
             for i, label in enumerate(labels)
         ]
+    
+    @staticmethod
+    def _apply_relation_evidence(
+        features: np.ndarray,
+        hyp_labels: Dict[str, int],
+        relations: List[RelationMention],
+        weight: float,
+    ) -> None:
+        """Add hypothesis-indexed evidence from typed relations (scaled by weight)."""
+        for relation in relations:
+            subj = relation.subject.lower()
+            obj = relation.object.lower()
+            subj_matches = [i for label, i in hyp_labels.items() if subj in label or label in subj]
+            obj_matches = [i for label, i in hyp_labels.items() if obj in label or label in obj]
+            sign = -1.0 if relation.negated else 1.0
+            w = weight
+            if relation.predicate in ("causes", "enables", "confirms", "is_a", "has_property"):
+                for idx in obj_matches:
+                    features[idx] += 0.8 * sign * w
+                for idx in subj_matches:
+                    features[idx] += 0.4 * sign * w
+            elif relation.predicate in ("prevents", "contradicts"):
+                for idx in obj_matches:
+                    features[idx] -= 0.8 * sign * w
+                for idx in subj_matches:
+                    features[idx] -= 0.3 * sign * w
+    
+    def _maybe_inject_causal_hypothesis(self, perception: Dict[str, Any], input_text: str) -> None:
+        """If causal fit is poor, ask Broca for a new SCM and register it (LLM only)."""
+        if not self.enable_hypothesis_generation or not self.use_llm or not self.broca:
+            return
+        if not hasattr(self.broca, "propose_causal_hypothesis"):
+            return
+        ar = perception.get("arena") or {}
+        if ar.get("tension", 0) < 0.72:
+            return
+        lls = ar.get("log_likelihoods") or {}
+        if lls and max(lls.values()) > -2.0:
+            return
+        try:
+            names = list(self.agent.arena.models.keys())
+            prop = self.broca.propose_causal_hypothesis(input_text[:2000], names)
+            scm = build_scm_from_proposal(prop)
+            if scm.name in self.agent.arena.models:
+                return
+            self.agent.add_causal_model(scm)
+            q = perception["belief_state"]
+            obs_idx = perception["observation_index"]
+            causal_obs: Dict[str, int] = {
+                "state": int(np.argmax(q)),
+                "observation": int(obs_idx),
+            }
+            if "mediated_causal" in self.agent.arena.models:
+                causal_obs["cause"] = int(np.argmax(q))
+            perception["arena"] = self.agent.arena.compete(causal_obs)
+        except Exception as e:
+            logger.warning("Dynamic causal hypothesis skipped: %s", e)
     
     def _observation_to_vector(self, parsed: ParsedObservation) -> np.ndarray:
         """
@@ -165,26 +311,10 @@ class CognitiveController:
                     if ename in label or label in ename:
                         features[idx] += 0.5
         
-        for relation in parsed.relations:
-            subj = relation.subject.lower()
-            obj = relation.object.lower()
-            
-            # Find which hypotheses the subject/object refer to
-            subj_matches = [i for label, i in hyp_labels.items() if subj in label or label in subj]
-            obj_matches = [i for label, i in hyp_labels.items() if obj in label or label in obj]
-            
-            sign = -1.0 if relation.negated else 1.0
-            
-            if relation.predicate in ("causes", "enables", "confirms", "is_a", "has_property"):
-                for idx in obj_matches:
-                    features[idx] += 0.8 * sign
-                for idx in subj_matches:
-                    features[idx] += 0.4 * sign
-            elif relation.predicate in ("prevents", "contradicts"):
-                for idx in obj_matches:
-                    features[idx] -= 0.8 * sign
-                for idx in subj_matches:
-                    features[idx] -= 0.3 * sign
+        self._apply_relation_evidence(features, hyp_labels, parsed.relations, weight=1.0)
+        self._apply_relation_evidence(
+            features, hyp_labels, parsed.implicit_relations, weight=IMPLICIT_RELATION_WEIGHT,
+        )
         
         # Linguistic confidence modulates the whole vector
         features *= parsed.confidence_linguistic
@@ -388,6 +518,7 @@ class CognitiveController:
         # === 2. PROCESS (Tensegrity cognition) ===
         obs_vector = self._observation_to_vector(parsed)
         perception = self.agent.perceive(obs_vector)
+        self._maybe_inject_causal_hypothesis(perception, input_text)
         
         # Update hypothesis probabilities from Tensegrity beliefs
         self._update_hypotheses_from_inference(perception, obs_vector)
@@ -399,6 +530,15 @@ class CognitiveController:
         
         for relation in parsed.relations:
             fact = f"[T{self.belief_state.turn}] {relation.subject} {relation.predicate} {relation.object}"
+            if relation.negated:
+                fact = f"NOT({fact})"
+            self.belief_state.confirmed_facts.append(fact)
+        
+        for relation in parsed.implicit_relations:
+            fact = (
+                f"[T{self.belief_state.turn}] (implicit) {relation.subject} "
+                f"{relation.predicate} {relation.object}"
+            )
             if relation.negated:
                 fact = f"NOT({fact})"
             self.belief_state.confirmed_facts.append(fact)
@@ -588,6 +728,7 @@ class CognitiveController:
         return ParsedObservation(
             entities=entities,
             relations=relations,
+            implicit_relations=[],
             is_question=is_question,
             is_assertion=not is_question and not is_command,
             is_command=is_command,

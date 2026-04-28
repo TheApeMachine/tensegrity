@@ -1,0 +1,28 @@
+[project]
+name = "tensegrity"
+version = "0.1.0"
+description = "Non-gradient cognitive architecture (free energy, causal models, Markov blankets)"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "scipy",
+    "networkx",
+    "pydantic",
+    "openai",
+    "torch",
+    "transformers",
+    "accelerate",
+    "datasets",
+    "sentence-transformers"
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0"]
+
+[build-system]
+requires = ["hatchling>=1.13"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["tensegrity"]

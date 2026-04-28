@@ -185,8 +185,8 @@ class EvalRunner:
     Runs baseline vs grafted evaluation on any set of tasks.
 
     Modes:
-      "local"   — Uses transformers model + confidence-gated Tensegrity v2 scoring
-      "offline"  — No LLM; baseline = random, grafted = v2 scoring
+      "local"   — Uses transformers model + confidence-gated semantic field scoring
+      "offline"  — No LLM; baseline = random, grafted = field scoring
 
     Local mode blending:
       effective_λ = λ * (1 - LLM_confidence / confidence_gate_threshold)
@@ -246,18 +246,18 @@ class EvalRunner:
         return scores
 
     def _get_tensegrity_scores(self, sample: TaskSample) -> Tuple[List[float], float]:
-        """Run Tensegrity v2 scoring bridge on a sample."""
-        from tensegrity.v2.graft import V2ScoringBridge
-        if not hasattr(self, '_v2_bridge'):
-            self._v2_bridge = V2ScoringBridge(
+        """Run semantic field scoring (ScoringBridge) on a sample."""
+        from tensegrity.engine.scoring import ScoringBridge
+        if not hasattr(self, '_field_scorer'):
+            self._field_scorer = ScoringBridge(
                 obs_dim=256, hidden_dims=[128, 32], fhrr_dim=2048,
                 ngc_settle_steps=30, ngc_learning_rate=0.01,
                 hopfield_beta=0.05, confidence_threshold=0.15,
                 context_settle_steps=40, choice_settle_steps=25,
                 context_learning_epochs=3,
             )
-        self._v2_bridge.reset()
-        return self._v2_bridge.score_choices(sample.prompt, sample.choices)
+        self._field_scorer.reset()
+        return self._field_scorer.score_choices(sample.prompt, sample.choices)
 
     def evaluate_sample(self, sample: TaskSample) -> SampleResult:
         """Evaluate a single sample with confidence-gated blending."""

@@ -28,6 +28,7 @@ from tensegrity.memory.associative import AssociativeMemory
 from tensegrity.causal.arena import CausalArena
 from tensegrity.causal.scm import StructuralCausalModel
 from tensegrity.inference.free_energy import FreeEnergyEngine
+from tensegrity.engine.unified_field import UnifiedField
 
 logger = logging.getLogger(__name__)
 
@@ -132,9 +133,20 @@ class TensegrityAgent:
         self._step_count = 0
         self._total_surprise = 0.0
         self._total_free_energy = 0.0
+        self._prev_belief_for_transition: Optional[np.ndarray] = None
         
         # Initialize with default competing models
         self._init_default_models()
+        
+        # Single perceptual substrate: FHRR → NGC → Hopfield (replaces parallel Morton-sense path).
+        self.field = UnifiedField(
+            obs_dim=256,
+            hidden_dims=[128, 32],
+            fhrr_dim=2048,
+            hopfield_beta=0.01,
+            ngc_settle_steps=20,
+            ngc_learning_rate=0.005,
+        )
     
     def _init_default_models(self):
         """
@@ -192,107 +204,71 @@ class TensegrityAgent:
     
     def perceive(self, raw_observation: np.ndarray) -> Dict[str, Any]:
         """
-        Process a raw observation through the full perception pipeline.
-        
-        1. Morton-encode the raw data (Markov blanket sensory boundary)
-        2. Map to observation index
-        3. Run free energy minimization (state inference)
-        4. Update all memory systems
-        5. Run causal arena competition
-        6. Store in episodic memory
-        7. Update associative memory
-        
-        Args:
-            raw_observation: Raw sensory data of any modality.
-                           Shape: (n_points, sensory_dims) or (sensory_dims,)
-        
-        Returns:
-            Perception results including beliefs, surprise, free energy
+        One perception path: numeric vector → UnifiedField (FHRR / NGC / Hopfield)
+        → discrete observation index → active inference engine → causal arena.
+
+        Episodic and classical Hopfield associative traces are not written here;
+        memory consolidation for this path lives inside UnifiedField.
         """
         self._step_count += 1
-        
-        # === 1. MARKOV BLANKET: Morton encode ===
-        morton_codes = self.blanket.sense(raw_observation)
-        obs_idx = self._morton_to_obs_index(morton_codes)
-        
-        # === 2. INFERENCE ENGINE: Minimize free energy ===
+        raw = np.asarray(raw_observation, dtype=np.float64).ravel()
+
+        cycle = self.field.observe(raw, input_type="numeric")
+        obs_vec = cycle["observation"]
+        decomp = cycle["energy"]
+        surprise = float(decomp.surprise)
+
+        # Deterministic discrete index for generative-model matrices
+        v = np.arange(1, len(obs_vec) + 1, dtype=np.float64)
+        obs_idx = int(np.abs(np.dot(obs_vec, v))) % max(self.n_obs, 1)
+
         A = self.epistemic.A
         B = self.epistemic.B
         C = self.epistemic.C
         D = self.epistemic.D
         log_A = self.epistemic.log_A
-        
+
         inference_result = self.engine.step(obs_idx, A, B, C, D, log_A)
-        q_states = inference_result['belief_state']
-        F = inference_result['free_energy']
-        
-        # === 3. EPISTEMIC MEMORY: Bayesian counting update ===
+        q_states = inference_result["belief_state"]
+        F = float(inference_result["free_energy"])
+
         self.epistemic.update_likelihood(obs_idx, q_states)
-        if self.engine.prev_action is not None and self._step_count > 1:
-            # Get previous belief state from episodic memory
-            prev_episodes = self.episodic.get_sequence(
-                self._step_count - 2, self._step_count - 2)
-            if prev_episodes:
-                prev_belief = prev_episodes[0].belief_state
-                self.epistemic.update_transition(
-                    prev_belief, q_states, self.engine.prev_action)
-        
-        # === 4. CAUSAL ARENA: Compete ===
-        # Map observation to causal variable values
+        if (self.engine.prev_action is not None
+                and self._prev_belief_for_transition is not None):
+            self.epistemic.update_transition(
+                self._prev_belief_for_transition, q_states,
+                self.engine.prev_action)
+        self._prev_belief_for_transition = q_states.copy()
+
         causal_obs = {
-            'state': int(np.argmax(q_states)),
-            'observation': obs_idx,
+            "state": int(np.argmax(q_states)),
+            "observation": obs_idx,
         }
-        # Add 'cause' for the mediated model
-        if 'mediated_causal' in self.arena.models:
-            causal_obs['cause'] = int(np.argmax(q_states))  # Best guess
-        
+        if "mediated_causal" in self.arena.models:
+            causal_obs["cause"] = int(np.argmax(q_states))
+
         arena_result = self.arena.compete(causal_obs)
-        
-        # === 5. EPISODIC MEMORY: Encode experience ===
-        episode = self.episodic.encode(
-            observation=raw_observation,
-            morton_code=morton_codes if isinstance(morton_codes, np.ndarray) 
-                       else np.array([morton_codes]),
-            belief_state=q_states,
-            action=self.engine.prev_action,
-            surprise=self.blanket.surprise,
-            free_energy=F,
-            metadata={
-                'obs_idx': obs_idx,
-                'arena_winner': arena_result['winner'],
-                'tension': arena_result['tension'],
-            }
-        )
-        
-        # === 6. ASSOCIATIVE MEMORY: Store pattern ===
-        pattern = self._obs_to_associative_pattern(obs_idx, q_states)
-        self.associative.store(pattern, metadata={
-            'obs_idx': obs_idx,
-            'step': self._step_count,
-            'surprise': self.blanket.surprise,
-        })
-        
-        # === 7. ASSOCIATIVE RETRIEVAL: Pattern completion ===
-        retrieved_pattern, energy = self.associative.retrieve(pattern, return_energy=True)
-        
-        # Track cumulative metrics
-        self._total_surprise += self.blanket.surprise
+
+        morton_codes = np.array([obs_idx], dtype=np.int64)
+        self.blanket.surprise = surprise
+
+        self._total_surprise += surprise
         self._total_free_energy += F
-        
+
         return {
-            'step': self._step_count,
-            'morton_codes': morton_codes,
-            'observation_index': obs_idx,
-            'belief_state': q_states,
-            'free_energy': F,
-            'surprise': self.blanket.surprise,
-            'action': inference_result['action'],
-            'action_confidence': inference_result['action_confidence'],
-            'arena': arena_result,
-            'associative_energy': energy,
-            'epistemic_value': self.engine.epistemic_value,
-            'pragmatic_value': self.engine.pragmatic_value,
+            "step": self._step_count,
+            "morton_codes": morton_codes,
+            "observation_index": obs_idx,
+            "belief_state": q_states,
+            "free_energy": F,
+            "surprise": surprise,
+            "action": inference_result["action"],
+            "action_confidence": inference_result["action_confidence"],
+            "arena": arena_result,
+            "associative_energy": float(decomp.memory),
+            "epistemic_value": self.engine.epistemic_value,
+            "pragmatic_value": self.engine.pragmatic_value,
+            "field_cycle": cycle,
         }
     
     def act(self) -> Dict[str, Any]:

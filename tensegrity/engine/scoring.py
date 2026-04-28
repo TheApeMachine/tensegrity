@@ -1,25 +1,12 @@
 """
-v2 Graft: Semantic scoring bridge + NGC logit bias injection.
-
-Scoring bridge (V2ScoringBridge):
-  Three-tier scoring for multiple-choice tasks:
-    1. SENTENCE-LEVEL: sbert cosine(prompt, choice) — strongest semantic signal
-    2. TOKEN-LEVEL: Semantic FHRR compositional similarity
-    3. NGC ENERGY: Hierarchical prediction error after settling
-  
-  All signals z-normalized and combined (1.0/0.3/0.2 weights).
-  Convergence gate abstains when signal has insufficient spread.
-
-NGCLogitsProcessor:
-  Per-decode-step logit bias injection during LLM generation.
-  NGC prediction errors projected into vocabulary space via fixed random matrices.
-  Only emits when NGC energy has converged (graceful fallback otherwise).
+Semantic scoring bridge + NGC logit bias injection (part of the unified engine).
 """
 
 import numpy as np
 from typing import Dict, List, Optional, Callable, Set, Tuple
 import math
 import logging
+import threading
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +24,8 @@ class NGCLogitsProcessor:
     supports_continuous_batching = False
     
     def __init__(self, field, tokenizer, vocab_projections=None,
-                 scale=1.0, energy_gate=0.1, max_settle_steps=30, max_bias=5.0):
+                 scale=1.0, energy_gate=0.1, max_settle_steps=30, max_bias=5.0,
+                 async_cognitive: bool = True):
         _ensure_torch()
         self.field = field
         self.tokenizer = tokenizer
@@ -45,11 +33,29 @@ class NGCLogitsProcessor:
         self.energy_gate = energy_gate
         self.max_settle_steps = max_settle_steps
         self.max_bias = max_bias
+        self.async_cognitive = async_cognitive
         self.vocab_size = tokenizer.vocab_size
         self.projections = vocab_projections or self._build_projections()
         self._step_count = 0
         self._emissions = 0
         self._total_settle_steps = 0
+        
+        self._lock = threading.Lock()
+        self._halt = threading.Event()
+        self._wake = threading.Event()
+        self._pending_ids: Optional[List[int]] = None
+        self._latest_bias_np: Optional[np.ndarray] = None
+        self._worker: Optional[threading.Thread] = None
+        if self.async_cognitive:
+            self._worker = threading.Thread(target=self._cognitive_loop, daemon=True)
+            self._worker.start()
+    
+    def close(self):
+        self._halt.set()
+        self._wake.set()
+        if self._worker is not None:
+            self._worker.join(timeout=2.0)
+            self._worker = None
     
     def _build_projections(self):
         projections = []
@@ -60,19 +66,17 @@ class NGCLogitsProcessor:
             projections.append(P)
         return projections
     
-    def __call__(self, input_ids, scores):
-        self._step_count += 1
-        ids = input_ids[0].tolist()[-16:]
+    def _compute_bias_from_ids(self, ids: List[int]) -> Optional[np.ndarray]:
         text = self.tokenizer.decode(ids, skip_special_tokens=True)
         tokens = text.lower().split()
         if not tokens:
-            return scores
+            return None
         obs = self.field._fhrr_to_obs(self.field.encoder.encode_sequence(tokens))
-        settle = self.field.ngc.settle(obs, steps=self.max_settle_steps)
-        self._total_settle_steps += self.max_settle_steps
+        settle = self.field.ngc.settle(obs)
+        self._total_settle_steps += int(settle.get("settle_steps", self.max_settle_steps))
         et = settle["energy_trace"]
         if len(et) < 2 or abs(et[-1] - et[-2]) >= self.energy_gate:
-            return scores
+            return None
         bias = np.zeros(self.vocab_size, dtype=np.float64)
         for ell in range(self.field.ngc.n_layers):
             err = self.field.ngc.layers[ell].error
@@ -83,7 +87,46 @@ class NGCLogitsProcessor:
         bias *= self.scale * confidence
         np.clip(bias, -self.max_bias, self.max_bias, out=bias)
         self._emissions += 1
-        return scores + torch.tensor(bias, device=scores.device, dtype=scores.dtype).unsqueeze(0)
+        return bias
+    
+    def _cognitive_loop(self):
+        while not self._halt.is_set():
+            if not self._wake.wait(timeout=0.05):
+                continue
+            self._wake.clear()
+            if self._halt.is_set():
+                break
+            ids = self._pending_ids
+            if ids is None:
+                continue
+            try:
+                bias_np = self._compute_bias_from_ids(ids)
+            except Exception as e:
+                logger.debug("NGC cognitive worker: %s", e)
+                bias_np = None
+            with self._lock:
+                self._latest_bias_np = bias_np
+    
+    def __call__(self, input_ids, scores):
+        self._step_count += 1
+        ids = input_ids[0].tolist()[-16:]
+        if self.async_cognitive:
+            self._pending_ids = ids
+            self._wake.set()
+            with self._lock:
+                bias_np = None if self._latest_bias_np is None else self._latest_bias_np.copy()
+            if bias_np is None:
+                return scores
+            return scores + torch.tensor(bias_np, device=scores.device, dtype=scores.dtype).unsqueeze(0)
+        
+        try:
+            bias_np = self._compute_bias_from_ids(ids)
+        except Exception as e:
+            logger.debug("NGCLogitsProcessor: %s", e)
+            return scores
+        if bias_np is None:
+            return scores
+        return scores + torch.tensor(bias_np, device=scores.device, dtype=scores.dtype).unsqueeze(0)
     
     @property
     def statistics(self):
@@ -94,7 +137,7 @@ class NGCLogitsProcessor:
         }
 
 
-class V2ScoringBridge:
+class ScoringBridge:
     """
     Semantic scoring bridge for benchmark evaluation.
     
@@ -107,7 +150,7 @@ class V2ScoringBridge:
                  hopfield_beta=0.05, confidence_threshold=0.15,
                  context_settle_steps=40, choice_settle_steps=25,
                  context_learning_epochs=3):
-        from tensegrity.v2.field import UnifiedField
+        from tensegrity.engine.unified_field import UnifiedField
         self.field = field or UnifiedField(
             obs_dim=obs_dim, hidden_dims=hidden_dims or [128, 32],
             fhrr_dim=fhrr_dim, hopfield_beta=hopfield_beta,

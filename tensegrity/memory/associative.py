@@ -46,7 +46,9 @@ class AssociativeMemory:
     
     def __init__(self, pattern_dim: int, beta: float = 1.0,
                  max_patterns: int = 10000, convergence_steps: int = 5,
-                 zipf_exponent: float = 1.0):
+                 zipf_exponent: float = 1.0,
+                 access_decay: float = 0.99,
+                 decay_every_n_retrieves: int = 50):
         """
         Args:
             pattern_dim: Dimensionality of stored patterns
@@ -55,12 +57,16 @@ class AssociativeMemory:
             max_patterns: Maximum number of stored patterns
             convergence_steps: Number of iterative updates for retrieval
             zipf_exponent: Controls power-law weighting of pattern importance
+            access_decay: Multiplicative decay applied to access counts periodically
+            decay_every_n_retrieves: Invoke decay every N retrieve() calls (0 = never)
         """
         self.dim = pattern_dim
         self.beta = beta
         self.max_patterns = max_patterns
         self.convergence_steps = convergence_steps
         self.zipf_s = zipf_exponent
+        self.access_decay = access_decay
+        self.decay_every_n_retrieves = decay_every_n_retrieves
         
         # Pattern storage matrix X ∈ ℝ^(dim × n_patterns)
         self.patterns: List[np.ndarray] = []
@@ -69,7 +75,17 @@ class AssociativeMemory:
         
         # Pattern metadata (labels, timestamps, access counts)
         self._metadata: List[Dict[str, Any]] = []
-        self._access_counts: List[int] = []
+        self._access_counts: List[float] = []
+        self._retrieve_calls = 0
+    
+    def clear(self):
+        """Drop all stored patterns (new episode)."""
+        self.patterns.clear()
+        self._metadata.clear()
+        self._access_counts.clear()
+        self._pattern_matrix = None
+        self._dirty = True
+        self._retrieve_calls = 0
     
     def store(self, pattern: np.ndarray, metadata: Optional[Dict] = None) -> int:
         """
@@ -97,7 +113,7 @@ class AssociativeMemory:
         idx = len(self.patterns)
         self.patterns.append(pattern.copy())
         self._metadata.append(metadata or {})
-        self._access_counts.append(0)
+        self._access_counts.append(0.0)
         self._dirty = True
         
         # Capacity management
@@ -126,6 +142,10 @@ class AssociativeMemory:
         """
         if not self.patterns:
             return (np.zeros(self.dim), float('inf')) if return_energy else np.zeros(self.dim)
+        
+        self._retrieve_calls += 1
+        if self.decay_every_n_retrieves > 0 and self._retrieve_calls % self.decay_every_n_retrieves == 0:
+            self._decay_access_counts()
         
         self._ensure_matrix()
         
@@ -199,6 +219,10 @@ class AssociativeMemory:
         if not self.patterns:
             return np.zeros(self.dim), np.array([])
         
+        self._retrieve_calls += 1
+        if self.decay_every_n_retrieves > 0 and self._retrieve_calls % self.decay_every_n_retrieves == 0:
+            self._decay_access_counts()
+        
         self._ensure_matrix()
         
         query = np.asarray(query, dtype=np.float64).flatten()
@@ -229,6 +253,12 @@ class AssociativeMemory:
                       self.beta * similarities.max()
         return float(-log_sum_exp / self.beta + 0.5 * np.dot(xi, xi))
     
+    def _decay_access_counts(self):
+        """Reduce access counts so stale dominance slowly evaporates."""
+        if not self._access_counts:
+            return
+        self._access_counts = [float(c) * self.access_decay for c in self._access_counts]
+    
     def _zipf_weights(self) -> np.ndarray:
         """
         Compute Zipf weights based on access frequency.
@@ -237,7 +267,7 @@ class AssociativeMemory:
         This creates a self-reinforcing power law: popular patterns
         become more accessible, rare patterns fade.
         """
-        counts = np.array(self._access_counts, dtype=np.float64) + 1.0
+        counts = np.maximum(self._access_counts, 0.0) + 1.0
         # Rank by access count (descending)
         ranks = np.argsort(np.argsort(-counts)) + 1  # 1-indexed ranks
         # Zipf weight: 1/rank^s
@@ -284,7 +314,7 @@ class AssociativeMemory:
             'n_patterns': len(self.patterns),
             'total_accesses': int(accesses.sum()),
             'mean_access': float(accesses.mean()),
-            'max_access': int(accesses.max()),
+            'max_access': float(accesses.max()),
             'beta': self.beta,
             'dimension': self.dim,
         }

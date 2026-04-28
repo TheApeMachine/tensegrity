@@ -1,5 +1,5 @@
 """
-Needle-in-Lies Test: Can v2's NGC detect the true statement among contradictions?
+Needle-in-Lies Test: Can NGC detect the true statement among contradictions?
 
 The test:
   - One true statement ("The key is under the oak table")
@@ -28,9 +28,9 @@ sys.path.insert(0, '/app')
 import numpy as np
 np.random.seed(42)
 
-from tensegrity.v2.fhrr import FHRREncoder, bind, bundle, unbind
-from tensegrity.v2.ngc import PredictiveCodingCircuit
-from tensegrity.v2.field import UnifiedField, HopfieldMemoryBank
+from tensegrity.engine.fhrr import FHRREncoder, bind, bundle, unbind
+from tensegrity.engine.ngc import PredictiveCodingCircuit
+from tensegrity.engine.unified_field import UnifiedField, HopfieldMemoryBank
 
 
 def make_needle_scenario(n_lies: int = 13):

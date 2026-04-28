@@ -1,5 +1,5 @@
 """
-Test Tensegrity v2: unified energy landscape.
+Tests for the unified cognitive engine: FHRR, NGC, and UnifiedField.
 """
 
 import sys
@@ -14,7 +14,7 @@ def test_fhrr_encoding():
     print("TEST 1: FHRR-RNS Compositional Encoding")
     print("=" * 60)
     
-    from tensegrity.v2.fhrr import FHRREncoder, bind, unbind, bundle
+    from tensegrity.engine.fhrr import FHRREncoder, bind, unbind, bundle
     
     enc = FHRREncoder(dim=2048)
     
@@ -61,12 +61,12 @@ def test_fhrr_encoding():
     print(f"  ✓ Same sequences more similar than different ones")
     
     # Test numeric vector encoding (modality-agnostic)
-    v1 = enc.encode_numeric_vector(np.array([1.0, 2.0, 3.0]))
-    v2 = enc.encode_numeric_vector(np.array([1.0, 2.0, 3.1]))
-    v3 = enc.encode_numeric_vector(np.array([9.0, 8.0, 7.0]))
+    v_base = enc.encode_numeric_vector(np.array([1.0, 2.0, 3.0]))
+    v_near = enc.encode_numeric_vector(np.array([1.0, 2.0, 3.1]))
+    v_far = enc.encode_numeric_vector(np.array([9.0, 8.0, 7.0]))
     
-    print(f"\n  sim([1,2,3], [1,2,3.1]) = {enc.similarity(v1, v2):.4f}")
-    print(f"  sim([1,2,3], [9,8,7])   = {enc.similarity(v1, v3):.4f}")
+    print(f"\n  sim([1,2,3], [1,2,3.1]) = {enc.similarity(v_base, v_near):.4f}")
+    print(f"  sim([1,2,3], [9,8,7])   = {enc.similarity(v_base, v_far):.4f}")
     print(f"  ✓ Numeric vectors: similar inputs → similar encodings")
     
     return True
@@ -78,7 +78,7 @@ def test_predictive_coding():
     print("TEST 2: Hierarchical Predictive Coding (NGC)")
     print("=" * 60)
     
-    from tensegrity.v2.ngc import PredictiveCodingCircuit
+    from tensegrity.engine.ngc import PredictiveCodingCircuit
     
     # 3-layer hierarchy: 64 → 32 → 8
     ngc = PredictiveCodingCircuit(
@@ -133,7 +133,6 @@ def test_predictive_coding():
     
     # THE KEY TEST: the system now PREDICTS its input
     predicted = ngc.predict_observation()
-    actual = pattern_a  # Last odd epoch was pattern_b, so next should predict pattern_a-ish
     residual = np.linalg.norm(predicted)
     print(f"\n  Prediction norm: {residual:.4f} (>0 means the system has learned to predict)")
     assert residual > 0.01, "System should generate non-trivial predictions"
@@ -149,7 +148,7 @@ def test_unified_field():
     print("TEST 3: Unified Energy Landscape")
     print("=" * 60)
     
-    from tensegrity.v2.field import UnifiedField
+    from tensegrity.engine.unified_field import UnifiedField
     
     field = UnifiedField(
         obs_dim=128,
@@ -216,8 +215,8 @@ def main():
     ]
     
     print("\n" + "█" * 60)
-    print("  TENSEGRITY v2: Unified Energy Architecture")
-    print("  FHRR-RNS × Predictive Coding × Hopfield Memory")
+    print("  Tensegrity engine: unified energy architecture")
+    print("  FHRR-RNS × Predictive Coding × Hopfield memory")
     print("█" * 60)
     
     results = []

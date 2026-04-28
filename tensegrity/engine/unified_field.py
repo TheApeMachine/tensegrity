@@ -1,8 +1,8 @@
 """
 Unified Energy Landscape: One functional to rule them all.
 
-The v1 architecture had four separate components doing four separate kinds
-of energy minimization. This module unifies them into a single energy
+Earlier designs used separate components for separate kinds of energy
+minimization. This module unifies them into a single energy
 functional that decomposes into local terms:
 
     E_total = E_perception + E_memory + E_causal
@@ -29,8 +29,8 @@ import numpy as np
 from typing import Dict, List, Optional, Any, Tuple
 from dataclasses import dataclass
 
-from tensegrity.v2.fhrr import FHRREncoder, bind, bundle, unbind
-from tensegrity.v2.ngc import PredictiveCodingCircuit
+from .fhrr import FHRREncoder, bind, bundle, unbind
+from .ngc import PredictiveCodingCircuit
 
 
 @dataclass
@@ -302,7 +302,7 @@ class UnifiedField:
         """
         What does the system expect to observe next?
         
-        This is the prediction that v1 never made.
+        This is the forward prediction from the settled internal state.
         """
         return self.ngc.predict_observation()
     
