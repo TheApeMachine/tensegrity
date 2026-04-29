@@ -175,6 +175,33 @@ def test_convergence_gating():
     print(f"  ✓ Resolved beliefs → biases emitted, winner boosted")
 
 
+def test_logits_processor_zero_prob_and_vocab_mismatch():
+    """Zero posteriors suppress, and processor adapts to model logits width."""
+    import torch
+    from tensegrity.graft.logit_bias import TensegrityLogitsProcessor
+
+    processor = TensegrityLogitsProcessor(
+        hypothesis_tokens={
+            "winner": {5},
+            "zero": {127_999},
+        },
+        belief_fn=lambda: {"winner": 1.0, "zero": 0.0},
+        vocab_size=128_000,
+        scale=2.5,
+        suppress_threshold=0.0,
+        entropy_gate=1.01,
+        min_confidence=0.0,
+    )
+    fake_input_ids = torch.zeros(1, 3, dtype=torch.long)
+    fake_scores = torch.zeros(1, 128_256)
+    modified = processor(fake_input_ids, fake_scores)
+
+    assert modified.shape == fake_scores.shape
+    assert torch.isfinite(modified[0, 5])
+    assert torch.isneginf(modified[0, 127_999])
+    assert modified[0, 128_255].item() == 0.0
+
+
 def test_rca_pipeline():
     """Run the root cause analysis scenario end-to-end."""
     print("\n" + "=" * 60)
@@ -270,5 +297,4 @@ def main():
 if __name__ == "__main__":
     ok = main()
     sys.exit(0 if ok else 1)
-
 

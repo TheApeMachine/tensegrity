@@ -17,7 +17,8 @@ data that doesn't match the schema.
 import os
 import json
 import logging
-from typing import Optional, Tuple, Type, TypeVar, Union, List
+import re
+from typing import Any, Optional, Tuple, Type, TypeVar, Union, List
 
 from pydantic import BaseModel
 
@@ -29,6 +30,9 @@ from tensegrity.broca.schemas import (
     BeliefState,
     CognitiveAction,
     ProposedSCM,
+    CausalEdge,
+    EntityMention,
+    RelationMention,
 )
 
 logger = logging.getLogger(__name__)
@@ -353,3 +357,475 @@ class BrocaInterface:
             "total_tokens": self._total_tokens,
             "model": self.model,
         }
+
+
+def _json_object_from_text(text: str) -> Optional[str]:
+    """Extract the first balanced JSON object from model output."""
+    start = text.find("{")
+    if start < 0:
+        return None
+    depth = 0
+    in_string = False
+    escape = False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if escape:
+            escape = False
+            continue
+        if ch == "\\":
+            escape = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start:i + 1]
+    return None
+
+
+def _hypotheses_from_context(context: Optional[str]) -> List[str]:
+    if not context:
+        return []
+    marker = "Active hypotheses:"
+    idx = context.find(marker)
+    if idx < 0:
+        return []
+    tail = context[idx + len(marker):]
+    tail = tail.split("|", 1)[0]
+    return [h.strip() for h in tail.split(",") if h.strip()]
+
+
+def _snake_identifier(text: str, fallback: str, max_len: int = 48) -> str:
+    """Normalize arbitrary text into a short SCM-safe identifier."""
+    parts = re.findall(r"[A-Za-z0-9]+", text.lower())
+    ident = "_".join(parts[:6]).strip("_")
+    if not ident:
+        ident = fallback
+    if ident[0].isdigit():
+        ident = f"v_{ident}"
+    return ident[:max_len].strip("_") or fallback
+
+
+def _unique_scm_name(base: str, existing_model_names: List[str]) -> str:
+    existing = {n.casefold() for n in existing_model_names}
+    root = _snake_identifier(base, "broca_model", max_len=48)
+    name = root
+    i = 1
+    while name.casefold() in existing:
+        suffix = f"_{i}"
+        name = f"{root[:64 - len(suffix)]}{suffix}"
+        i += 1
+    return name
+
+
+class DeterministicBrocaInterface:
+    """
+    Schema-valid Broca transducer used when no remote/local structured LLM
+    parse is available.
+
+    This keeps the controller path honest: parsing still crosses the Broca
+    boundary and returns ``ParsedObservation``. It is not a scorer and it does
+    not choose actions.
+    """
+
+    def __init__(self, model: str = "deterministic-broca"):
+        self.model = model
+        self._parse_calls = 0
+        self._hypothesis_calls = 0
+        self._produce_calls = 0
+        self._total_tokens = 0
+
+    def parse(self, text: str, context: Optional[str] = None) -> ParsedObservation:
+        self._parse_calls += 1
+        text_lower = text.lower()
+        words = re.findall(r"[a-zA-Z]+(?:'[a-z]+)?|[0-9]+(?:\.[0-9]+)?", text_lower)
+        hypotheses = _hypotheses_from_context(context)
+        entities: List[EntityMention] = []
+        relations: List[RelationMention] = []
+
+        seen_entities = set()
+
+        def add_entity(surface: str, entity_type: str = "object", normalized: Optional[str] = None):
+            norm = (normalized or surface).strip().lower()
+            key = (surface.strip().lower(), norm, entity_type)
+            if not surface.strip() or key in seen_entities:
+                return
+            seen_entities.add(key)
+            entities.append(EntityMention(
+                text=surface.strip(),
+                entity_type=entity_type,  # type: ignore[arg-type]
+                normalized=norm,
+            ))
+
+        for token in words[:32]:
+            if len(token) > 2:
+                add_entity(token, "other", token)
+
+        positive_markers = {
+            "because", "cause", "causes", "caused", "therefore", "result", "supports",
+            "support", "confirms", "shows", "has", "is", "are", "leads", "enables",
+        }
+        negative_markers = {
+            "not", "no", "never", "without", "lacks", "contradicts", "false",
+            "incorrect", "cannot", "can't", "isn't", "doesn't", "prevents",
+        }
+        has_positive = any(w in text_lower for w in positive_markers)
+        has_negative = any(w in text_lower for w in negative_markers)
+
+        for hyp in hypotheses:
+            hyp_lower = hyp.lower()
+            parts = [p for p in re.findall(r"[a-zA-Z0-9]+", hyp_lower) if len(p) > 2]
+            mentioned = hyp_lower in text_lower or any(p in text_lower for p in parts)
+            if not mentioned:
+                continue
+            add_entity(hyp, "object", hyp_lower)
+            if has_negative and not has_positive:
+                relations.append(RelationMention(
+                    subject="input",
+                    predicate="contradicts",
+                    object=hyp,
+                    negated=False,
+                ))
+            else:
+                relations.append(RelationMention(
+                    subject="input",
+                    predicate="confirms",
+                    object=hyp,
+                    negated=False,
+                ))
+
+        causal_patterns = [
+            (r"\b(.{1,64}?)\s+(?:causes|caused|leads to|produces|results in)\s+(.{1,64}?)(?:[.?!]|$)", "causes"),
+            (r"\b(.{1,64}?)\s+(?:prevents|blocks|stops)\s+(.{1,64}?)(?:[.?!]|$)", "prevents"),
+            (r"\b(.{1,64}?)\s+(?:enables|allows)\s+(.{1,64}?)(?:[.?!]|$)", "enables"),
+        ]
+        for pattern, predicate in causal_patterns:
+            for m in re.finditer(pattern, text_lower):
+                subj = m.group(1).strip(" ,;:")
+                obj = m.group(2).strip(" ,;:")
+                if subj and obj:
+                    add_entity(subj, "event", subj)
+                    add_entity(obj, "event", obj)
+                    relations.append(RelationMention(
+                        subject=subj,
+                        predicate=predicate,  # type: ignore[arg-type]
+                        object=obj,
+                        negated=False,
+                    ))
+
+        negation_words = {"not", "no", "never", "neither", "nor", "isn't", "doesn't", "can't", "won't", "cannot"}
+        negation = any(nw in text_lower for nw in negation_words)
+        is_question = text.strip().endswith("?")
+        is_command = bool(words[:1] and words[0] in {"tell", "show", "give", "find", "choose", "pick", "answer"})
+
+        return ParsedObservation(
+            entities=entities[:64],
+            relations=relations[:48],
+            implicit_relations=[],
+            is_question=is_question,
+            is_assertion=not is_question and not is_command,
+            is_command=is_command,
+            negation_present=negation,
+            temporal_marker=None,
+            confidence_linguistic=0.75 if relations else 0.45,
+        )
+
+    def parse_feedback(self, feedback: str, action_taken: str, hypotheses: list) -> ParsedFeedback:
+        self._parse_calls += 1
+        text_lower = feedback.lower()
+        if any(w in text_lower for w in ["correct", "right", "success", "yes"]):
+            outcome = "success"
+        elif any(w in text_lower for w in ["wrong", "incorrect", "failure", "no"]):
+            outcome = "failure"
+        else:
+            outcome = "ambiguous"
+        return ParsedFeedback(
+            outcome=outcome,  # type: ignore[arg-type]
+            confirms_hypothesis=None,
+            contradicts_hypothesis=None,
+            new_information=[],
+            surprise_linguistic=0.5,
+        )
+
+    def propose_causal_hypothesis(
+        self,
+        situation_summary: str,
+        existing_model_names: List[str],
+    ) -> ProposedSCM:
+        """
+        Deterministic Broca-side SCM proposal.
+
+        The proposal is deliberately small and compatible with the agent arena's
+        observed variables (``state`` and ``observation``), while allowing one
+        latent contextual cause extracted from the current situation.
+        """
+        self._hypothesis_calls += 1
+        summary, _ = truncate_to_sentence(situation_summary, max_len=512)
+        text_lower = summary.lower()
+        name = _unique_scm_name("broca_contextual_causal", existing_model_names)
+
+        causal_patterns = [
+            r"\b(.{1,48}?)\s+(?:causes|caused|leads to|produces|results in)\s+(.{1,48}?)(?:[.?!]|$)",
+            r"\b(.{1,48}?)\s+(?:enables|allows)\s+(.{1,48}?)(?:[.?!]|$)",
+            r"\b(.{1,48}?)\s+(?:prevents|blocks|stops)\s+(.{1,48}?)(?:[.?!]|$)",
+        ]
+        latent_source = "context_signal"
+        latent_effect = "state"
+        mechanism: str = "causes"
+        for pattern in causal_patterns:
+            m = re.search(pattern, text_lower)
+            if not m:
+                continue
+            latent_source = _snake_identifier(m.group(1), "context_signal")
+            latent_effect = _snake_identifier(m.group(2), "state")
+            matched = m.group(0)
+            if "prevent" in matched or "block" in matched or "stop" in matched:
+                mechanism = "prevents"
+            elif "enable" in matched or "allow" in matched:
+                mechanism = "enables"
+            else:
+                mechanism = "causes"
+            break
+
+        if latent_source in {"cause", "state", "observation"}:
+            latent_source = "context_signal"
+        if latent_effect in {"cause", "state", "observation"}:
+            latent_effect = "context_signal"
+
+        edges = [
+            CausalEdge(source="cause", target=latent_source, mechanism="enables"),
+            CausalEdge(source=latent_source, target="state", mechanism=mechanism),  # type: ignore[arg-type]
+            CausalEdge(source="state", target="observation", mechanism="causes"),
+        ]
+        if latent_effect != latent_source:
+            edges.insert(2, CausalEdge(source=latent_source, target=latent_effect, mechanism=mechanism))  # type: ignore[arg-type]
+
+        return ProposedSCM(
+            name=name,
+            description=summary[:512] or "Contextual causal bridge between latent cause, state, and observation.",
+            edges=edges,
+        )
+
+    def produce(self, action: CognitiveAction, belief_state: BeliefState, audience: str = "user") -> Utterance:
+        self._produce_calls += 1
+        return Utterance(text=self.produce_simple(action), register="casual")
+
+    def produce_simple(self, action: CognitiveAction) -> str:
+        templates = {
+            "ask_question": f"Can you tell me about {action.target}?",
+            "state_belief": f"Based on what I know, I believe {action.content}.",
+            "propose_hypothesis": f"Here's a possibility: {action.content}",
+            "eliminate_hypothesis": f"I can rule out {action.target}.",
+            "state_conclusion": f"My conclusion: {action.content}",
+            "defer": "I don't have enough information yet to be sure.",
+            "request_intervention": f"What happens if we change {action.target}?",
+        }
+        return templates.get(action.action_type, f"[{action.action_type}]: {action.content}")
+
+    @property
+    def statistics(self):
+        return {
+            "parse_calls": self._parse_calls,
+            "hypothesis_calls": self._hypothesis_calls,
+            "produce_calls": self._produce_calls,
+            "total_tokens": self._total_tokens,
+            "model": self.model,
+        }
+
+
+class LocalBrocaInterface(DeterministicBrocaInterface):
+    """
+    Broca parser backed by the local benchmark LLM.
+
+    The local model is asked for a bounded JSON object and the result is
+    schema-validated. Invalid generations fall back to the deterministic
+    transducer so cognition still receives a valid typed observation.
+    """
+
+    def __init__(
+        self,
+        model: Any,
+        tokenizer: Any,
+        model_name: str = "local-broca",
+        max_parse_tokens: int = 256,
+    ):
+        super().__init__(model=model_name)
+        self._model_obj = model
+        self._tokenizer = tokenizer
+        self.max_parse_tokens = int(max_parse_tokens)
+
+    def parse(self, text: str, context: Optional[str] = None) -> ParsedObservation:
+        self._parse_calls += 1
+        try:
+            generated = self._generate_parse_json(text, context)
+            json_text = _json_object_from_text(generated)
+            if json_text is None:
+                raise ValueError("local Broca emitted no JSON object")
+            return ParsedObservation.model_validate_json(json_text)
+        except Exception as e:
+            logger.debug("Local Broca parse fell back to deterministic transducer: %s", e)
+            # Avoid double-counting fallback as a separate Broca call.
+            self._parse_calls -= 1
+            parsed = super().parse(text, context)
+            return parsed
+
+    def propose_causal_hypothesis(
+        self,
+        situation_summary: str,
+        existing_model_names: List[str],
+    ) -> ProposedSCM:
+        self._hypothesis_calls += 1
+        try:
+            generated = self._generate_proposal_json(situation_summary, existing_model_names)
+            json_text = _json_object_from_text(generated)
+            if json_text is None:
+                raise ValueError("local Broca emitted no ProposedSCM JSON object")
+            proposed = ProposedSCM.model_validate_json(json_text)
+            nodes = {e.source for e in proposed.edges} | {e.target for e in proposed.edges}
+            if "state" not in nodes or "observation" not in nodes:
+                raise ValueError("local Broca ProposedSCM did not include state and observation")
+            existing_lower = {n.casefold(): n for n in existing_model_names}
+            if proposed.name.casefold() in existing_lower:
+                proposed.name = _unique_scm_name(proposed.name, existing_model_names)
+            return proposed
+        except Exception as e:
+            logger.debug("Local Broca SCM proposal fell back to deterministic transducer: %s", e)
+            self._hypothesis_calls -= 1
+            return super().propose_causal_hypothesis(situation_summary, existing_model_names)
+
+    def _generate_parse_json(self, text: str, context: Optional[str]) -> str:
+        import torch
+
+        schema_hint = {
+            "entities": [{"text": "surface text", "entity_type": "object", "normalized": "canonical"}],
+            "relations": [{"subject": "x", "predicate": "causes", "object": "y", "negated": False}],
+            "implicit_relations": [],
+            "is_question": False,
+            "is_assertion": True,
+            "is_command": False,
+            "negation_present": False,
+            "temporal_marker": None,
+            "confidence_linguistic": 0.8,
+        }
+        system = (
+            "You are Broca: a linguistic transducer. Extract only typed structure. "
+            "Do not answer, explain, or evaluate. Return only valid JSON matching this shape: "
+            f"{json.dumps(schema_hint)}"
+        )
+        user = f"Context: {context or 'New conversation'}\n\nInput:\n{text}"
+        messages = [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ]
+
+        if hasattr(self._tokenizer, "apply_chat_template"):
+            encoded = self._tokenizer.apply_chat_template(
+                messages,
+                return_tensors="pt",
+                add_generation_prompt=True,
+            )
+            input_ids = encoded.input_ids if hasattr(encoded, "input_ids") else encoded
+            attention_mask = (
+                getattr(encoded, "attention_mask", None)
+                if hasattr(encoded, "input_ids")
+                else None
+            )
+            if attention_mask is None:
+                attention_mask = torch.ones_like(input_ids)
+        else:
+            prompt = f"{system}\n\n{user}\n\nJSON:"
+            encoded = self._tokenizer(prompt, return_tensors="pt", truncation=True, max_length=768)
+            input_ids = encoded["input_ids"]
+            attention_mask = encoded.get("attention_mask")
+            if attention_mask is None:
+                attention_mask = torch.ones_like(input_ids)
+
+        if hasattr(self._model_obj, "device"):
+            input_ids = input_ids.to(self._model_obj.device)
+            attention_mask = attention_mask.to(self._model_obj.device)
+
+        pad_token_id = getattr(self._tokenizer, "eos_token_id", None)
+        with torch.no_grad():
+            out = self._model_obj.generate(
+                input_ids,
+                attention_mask=attention_mask,
+                max_new_tokens=self.max_parse_tokens,
+                do_sample=False,
+                pad_token_id=pad_token_id,
+            )
+        new_tokens = out[0][input_ids.shape[1]:]
+        return self._tokenizer.decode(new_tokens, skip_special_tokens=True)
+
+    def _generate_proposal_json(
+        self,
+        situation_summary: str,
+        existing_model_names: List[str],
+    ) -> str:
+        import torch
+
+        schema_hint = {
+            "name": "broca_contextual_causal_1",
+            "description": "One sentence describing the causal model.",
+            "edges": [
+                {"source": "cause", "target": "state", "mechanism": "enables"},
+                {"source": "state", "target": "observation", "mechanism": "causes"},
+            ],
+        }
+        existing = ", ".join(existing_model_names[:24]) if existing_model_names else "(none)"
+        summary, _ = truncate_to_sentence(situation_summary, _CAUSAL_SUMMARY_MAX_CHARS)
+        system = (
+            "You are Broca proposing one small SCM schema for the causal arena. "
+            "Return only valid JSON. Use short snake_case identifiers. "
+            "The graph must be acyclic and must include state and observation so "
+            "the arena can score the model from agent observations. Shape: "
+            f"{json.dumps(schema_hint)}"
+        )
+        user = f"Existing model names: {existing}\n\nSituation:\n{summary}"
+        messages = [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ]
+
+        if hasattr(self._tokenizer, "apply_chat_template"):
+            encoded = self._tokenizer.apply_chat_template(
+                messages,
+                return_tensors="pt",
+                add_generation_prompt=True,
+            )
+            input_ids = encoded.input_ids if hasattr(encoded, "input_ids") else encoded
+            attention_mask = (
+                getattr(encoded, "attention_mask", None)
+                if hasattr(encoded, "input_ids")
+                else None
+            )
+            if attention_mask is None:
+                attention_mask = torch.ones_like(input_ids)
+        else:
+            prompt = f"{system}\n\n{user}\n\nJSON:"
+            encoded = self._tokenizer(prompt, return_tensors="pt", truncation=True, max_length=768)
+            input_ids = encoded["input_ids"]
+            attention_mask = encoded.get("attention_mask")
+            if attention_mask is None:
+                attention_mask = torch.ones_like(input_ids)
+
+        if hasattr(self._model_obj, "device"):
+            input_ids = input_ids.to(self._model_obj.device)
+            attention_mask = attention_mask.to(self._model_obj.device)
+
+        pad_token_id = getattr(self._tokenizer, "eos_token_id", None)
+        with torch.no_grad():
+            out = self._model_obj.generate(
+                input_ids,
+                attention_mask=attention_mask,
+                max_new_tokens=self.max_parse_tokens,
+                do_sample=False,
+                pad_token_id=pad_token_id,
+            )
+        new_tokens = out[0][input_ids.shape[1]:]
+        return self._tokenizer.decode(new_tokens, skip_special_tokens=True)

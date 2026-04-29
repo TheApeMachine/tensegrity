@@ -125,6 +125,7 @@ class PredictiveCodingCircuit:
         self.precision_min = precision_min
         self.precision_max = precision_max
         self.max_history_length = max(1, int(max_history_length))
+        self.activation = activation
         
         # Activation function
         self._phi, self._phi_deriv = self._get_activation(activation)
@@ -167,6 +168,17 @@ class PredictiveCodingCircuit:
         
         # Warm-start: last observation for change detection
         self._last_obs: Optional[np.ndarray] = None
+
+    def __getstate__(self) -> Dict[str, Any]:
+        state = self.__dict__.copy()
+        state.pop("_phi", None)
+        state.pop("_phi_deriv", None)
+        return state
+
+    def __setstate__(self, state: Dict[str, Any]) -> None:
+        self.__dict__.update(state)
+        activation = self.__dict__.get("activation", "tanh")
+        self._phi, self._phi_deriv = self._get_activation(activation)
     
     def _get_activation(self, name: str):
         """Get activation function and its derivative."""
@@ -495,6 +507,5 @@ class PredictiveCodingCircuit:
             "energy_history_len": len(self.energy_history),
             "last_error_norms": self.error_history[-1] if self.error_history else [],
         }
-
 
 

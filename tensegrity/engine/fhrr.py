@@ -127,6 +127,18 @@ class SemanticFHRRCodebook(FHRRCodebook):
         self._proj_seed = seed
         self._proj: Optional[np.ndarray] = None
 
+    def __getstate__(self) -> Dict[str, Any]:
+        state = self.__dict__.copy()
+        # SentenceTransformer instances hold non-serializable clients/locks and
+        # can be recreated lazily. Persist the projected phasors, not the model.
+        state["_sbert"] = "FALLBACK"
+        return state
+
+    def __setstate__(self, state: Dict[str, Any]) -> None:
+        self.__dict__.update(state)
+        if self.__dict__.get("_sbert") not in (None, "FALLBACK"):
+            self._sbert = "FALLBACK"
+
     @property
     def vectors(self) -> np.ndarray:
         """Rows of active codebook entries (shape ``(n_symbols, dim)``)."""
@@ -172,9 +184,13 @@ class SemanticFHRRCodebook(FHRRCodebook):
             )
             self._sbert = "FALLBACK"
             self._proj = None
-        except Exception:
-            logger.exception("SemanticFHRR: unexpected error loading SBERT")
-            raise
+        except Exception as exc:
+            logger.warning(
+                "SemanticFHRR: unexpected SBERT load failure (%s); deterministic vectors",
+                exc,
+            )
+            self._sbert = "FALLBACK"
+            self._proj = None
 
     def get_sbert_model(self) -> Optional[Any]:
         """Return the loaded ``SentenceTransformer`` when available; else ``None``."""
@@ -301,6 +317,15 @@ class FHRREncoder:
         for role in ["position", "value", "type", "attribute", "relation",
                      "subject", "object", "time", "channel"]:
             self.roles.register(role)
+
+    def __getstate__(self) -> Dict[str, Any]:
+        state = self.__dict__.copy()
+        state.pop("_position_cache_lock", None)
+        return state
+
+    def __setstate__(self, state: Dict[str, Any]) -> None:
+        self.__dict__.update(state)
+        self._position_cache_lock = threading.Lock()
     
     def _select_coprimes(self, n: int, min_product: int) -> List[int]:
         primes = [101, 103, 107, 109, 113, 127, 131, 137, 139, 149]

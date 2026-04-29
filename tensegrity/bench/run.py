@@ -44,7 +44,15 @@ def main():
         "--max-samples", type=int, default=None, help="Max samples per task (default: all)"
     )
     parser.add_argument(
-        "--lam", type=float, default=1.0, help="λ — graft weight: score = baseline + λ*tensegrity (default: 1.0)"
+        "--lam",
+        type=float,
+        default=1.0,
+        help="λ — precision of the LLM-likelihood evidence channel inside the canonical posterior",
+    )
+    parser.add_argument(
+        "--state-path",
+        default=".tensegrity/agent_state.pkl",
+        help="Persistent canonical agent state path (default: .tensegrity/agent_state.pkl)",
     )
     parser.add_argument(
         "--sweep", action="store_true", help="Run λ sweep over [0, 0.1, 0.25, 0.5, 1.0, 2.0]"
@@ -84,6 +92,7 @@ def main():
         mode=args.mode,
         lam=args.lam,
         seed=args.seed,
+        state_path=args.state_path,
     )
 
     if args.sweep:

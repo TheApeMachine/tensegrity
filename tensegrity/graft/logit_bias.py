@@ -260,13 +260,13 @@ class TensegrityLogitsProcessor:
                     continue
                 token_scores = self.hypothesis_token_scores.get(hyp_id, {})
                 
-                if prob < self.suppress_threshold:
+                if prob <= self.suppress_threshold:
                     for tid in token_ids:
                         if 0 <= tid < self.vocab_size:
                             bias[tid] = -np.inf
                             suppressed += 1
                 else:
-                    b = self.scale * math.log(prob / p_uniform)
+                    b = self.scale * math.log(max(float(prob), 1e-12) / p_uniform)
                     b = max(-self.max_bias, min(self.max_bias, b))
                     for tid in token_ids:
                         if 0 <= tid < self.vocab_size:
@@ -317,10 +317,15 @@ class TensegrityLogitsProcessor:
             return scores
         
         _ensure_torch()
-        bias = torch.tensor(bias_np, device=scores.device, dtype=scores.dtype)
         assert scores.shape[0] == 1, (
             f"TensegrityLogitsProcessor expects batch size 1, got {scores.shape[0]}"
         )
+        score_vocab = int(scores.shape[-1])
+        if bias_np.shape[0] < score_vocab:
+            bias_np = np.pad(bias_np, (0, score_vocab - bias_np.shape[0]), constant_values=0.0)
+        elif bias_np.shape[0] > score_vocab:
+            bias_np = bias_np[:score_vocab]
+        bias = torch.tensor(bias_np, device=scores.device, dtype=scores.dtype)
         return scores + bias.unsqueeze(0)
 
 
@@ -370,7 +375,7 @@ class StaticLogitBiasBuilder:
             token_ids = self.hypothesis_tokens.get(hyp_id, set())
             token_scores = self.hypothesis_token_scores.get(hyp_id, {})
             
-            if prob < self.suppress_threshold:
+            if prob <= self.suppress_threshold:
                 for tid in token_ids:
                     bias[tid] = -100.0  # OpenAI convention for hard suppress
             else:
@@ -382,4 +387,3 @@ class StaticLogitBiasBuilder:
                     bias[tid] = bias.get(tid, 0.0) + weighted_b
         
         return bias
-

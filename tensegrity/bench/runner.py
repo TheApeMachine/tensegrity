@@ -1,24 +1,11 @@
 """
-Evaluation Runner: Baseline (plain LLM) vs Grafted (Tensegrity+LLM).
+Evaluation Runner: raw LLM readout vs one integrated Tensegrity agent.
 
-Two evaluation modes per sample:
-
-  BASELINE: Model scores each choice via log-probability.
-            P(choice | prompt) computed from raw logits.
-            Prediction = argmax over choices.
-
-  GRAFTED:  score(choice) = llm_logprob(choice) + λ_eff * tensegrity_score(choice)
-            Where λ_eff = λ * (1 - LLM_confidence/threshold) in local mode.
-            The graft is a confidence-gated tiebreaker, not an equal-weight competitor.
-
-The ONLY difference is the additive Tensegrity term.
-This is a controlled A/B comparison.
-
-Local mode blending:
-  1. Compute LLM confidence from normalized entropy of softmax(log_probs)
-  2. If LLM confident (norm_entropy < 0.4): don't apply graft (preserve good preds)
-  3. If LLM uncertain: apply graft scaled by uncertainty and proportional to LLM score range
-  4. Graft magnitude capped at 0.3× of the LLM's own score spread
+The local LLM still exposes per-choice log-likelihoods, but those logits are
+now sensory evidence inside the canonical agent. The final benchmark answer is
+the agent's posterior commitment after integrating linguistic evidence,
+predictive-coding falsification, causal energy, and persistent memory. The
+benchmark label is consumed only afterward as feedback for online learning.
 """
 
 import numpy as np
@@ -26,8 +13,8 @@ import time
 import json
 import logging
 import hashlib
-from typing import List, Optional, Tuple
-from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Set, Tuple
+from dataclasses import dataclass, field
 
 from tensegrity.bench.tasks import TaskSample, TASK_REGISTRY, load_task_samples
 from tensegrity.torch_device import inference_load_settings
@@ -55,6 +42,9 @@ class SampleResult:
     flip_type: str
     lam: float
     wall_time: float
+    emitted_answer: str = ""
+    emission_mode: str = ""
+    emission_graft_state: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -187,16 +177,11 @@ class BenchmarkResult:
 
 class EvalRunner:
     """
-    Runs baseline vs grafted evaluation on any set of tasks.
+    Runs raw LLM readout vs the persistent integrated agent.
 
     Modes:
-      "local"   — Uses transformers model + confidence-gated semantic field scoring
-      "offline"  — No LLM; baseline = random, grafted = field scoring
-
-    Local mode blending:
-      effective_λ = λ * (1 - LLM_confidence / confidence_gate_threshold)
-      graft_score is scaled to 0.3× of LLM score range
-      If LLM is confident (entropy < 0.4×max): effective_λ = 0 (don't interfere)
+      "local"   — Uses transformers log-likelihoods as linguistic evidence
+      "offline" — No LLM; runs the same canonical agent without that channel
     """
 
     def __init__(
@@ -204,11 +189,13 @@ class EvalRunner:
         mode: str = "offline",
         lam: float = 1.0,
         seed: int = 42,
+        state_path: Optional[str] = ".tensegrity/agent_state.pkl",
     ):
         self.model_name = model_name
         self.mode = mode
         self.lam = lam
         self.seed = seed
+        self.state_path = state_path
         self._model = None
         self._tokenizer = None
 
@@ -232,6 +219,14 @@ class EvalRunner:
         if move_to is not None:
             self._model = self._model.to(move_to)
         
+        generation_config = getattr(self._model, "generation_config", None)
+        if generation_config is not None:
+            generation_config.do_sample = False
+            if hasattr(generation_config, "temperature"):
+                generation_config.temperature = 1.0
+            if hasattr(generation_config, "top_p"):
+                generation_config.top_p = 1.0
+
         self._model.eval()
 
     def _score_choices_local(self, prompt: str, choices: List[str]) -> List[float]:
@@ -271,7 +266,30 @@ class EvalRunner:
             scores.append(choice_log_prob / n_choice_tokens)
         return scores
 
-    def _get_tensegrity_scores(self, sample: TaskSample) -> Tuple[List[float], float]:
+    def _broca_for_canonical(self):
+        """Build the Broca transducer used by the canonical benchmark path."""
+        if hasattr(self, "_broca"):
+            return self._broca
+        if self.mode == "local":
+            self._init_model()
+            from tensegrity.broca.interface import LocalBrocaInterface
+
+            self._broca = LocalBrocaInterface(
+                model=self._model,
+                tokenizer=self._tokenizer,
+                model_name=self.model_name,
+            )
+        else:
+            from tensegrity.broca.interface import DeterministicBrocaInterface
+
+            self._broca = DeterministicBrocaInterface()
+        return self._broca
+
+    def _get_tensegrity_scores(
+        self,
+        sample: TaskSample,
+        linguistic_scores: Optional[List[float]],
+    ) -> Tuple[List[float], float, Any]:
         """Run the canonical agent pipeline on one item.
 
         Wires every shipped subsystem: CognitiveController + TensegrityAgent
@@ -280,38 +298,13 @@ class EvalRunner:
         EnergyCausalArena + TopologyMapper for per-choice causal competition,
         NGC top-down falsification.
 
-        **Bench-specific behavior**: In ``single`` scorer mode (`TENSEGRITY_SCORER` env),
-        :meth:`ScoringBridge.reset` is called **once per benchmark sample**, so episodic /
-        Hopfield state does not accumulate across MC items — each example is isolated.
-
-        In the default canonical mode, reuse a single :class:`CanonicalPipeline` for all
-        samples — per-item hypotheses and SMCs come from ``reset_for_item`` /
-        ``_soft_reset_in_place``. Rebuilding the pipeline on each row would recreate
-        the agent stack and repeatedly load sentence-transformer weights into memory.
-        :meth:`CanonicalPipeline.reset_session` is invoked **once per task**
-        (``EvalRunner.evaluate_task``), wiping cross-task leakage while permitting
-        within-task learning where applicable.
-
-        Prefer ``canonical`` for behavior aligned with HybridPipeline/session semantics;
-        use ``single`` for a deterministic, isolated field snapshot per sample.
+        One :class:`CanonicalPipeline` instance is reused for all samples and
+        tasks. Per-item hypotheses are rewritten in place; field weights,
+        episodic memory, Hopfield attractors, epistemic counts, and the agent
+        causal arena persist. ``linguistic_scores`` are LLM log-likelihoods and
+        are integrated inside the posterior update, not added afterward.
         """
-        import os
         import numpy as np
-
-        # Escape hatch: opt back into the legacy single-shot field scorer.
-        if os.environ.get("TENSEGRITY_SCORER", "canonical").lower() == "single":
-            from tensegrity.engine.scoring import ScoringBridge
-
-            if not hasattr(self, "_field_scorer"):
-                self._field_scorer = ScoringBridge(
-                    obs_dim=256, hidden_dims=[128, 32], fhrr_dim=2048,
-                    ngc_settle_steps=30, ngc_learning_rate=0.01,
-                    hopfield_beta=0.05, confidence_threshold=0.15,
-                    context_settle_steps=40, choice_settle_steps=25,
-                    context_learning_epochs=3,
-                )
-            self._field_scorer.reset()
-            return self._field_scorer.score_choices(sample.prompt, sample.choices)
 
         from tensegrity.pipeline.canonical import CanonicalPipeline
 
@@ -323,8 +316,9 @@ class EvalRunner:
             # "Loading weights" for each benchmark row (see CanonicalPipeline docs).
             self._canonical = CanonicalPipeline(
                 hypothesis_labels=None,
-                use_llm_broca=False,
-                enable_hypothesis_generation=False,
+                broca=self._broca_for_canonical(),
+                use_llm_broca=True,
+                enable_hypothesis_generation=True,
                 model_name=self.model_name,
                 max_iterations=3,
                 commit_ratio=2.0,
@@ -332,37 +326,251 @@ class EvalRunner:
                 falsify_update_strength=1.0,
                 energy_arena_precision=1.0,
                 energy_arena_beta=1.0,
+                max_hypotheses=8,
+                llm_evidence_weight=self.lam,
+                memory_evidence_weight=0.75,
+                persistent_state_path=self.state_path,
             )
+        else:
+            self._canonical.llm_evidence_weight = self.lam
 
-        result = self._canonical.score_multichoice(sample)
+        result = self._canonical.score_multichoice(
+            sample,
+            linguistic_scores=linguistic_scores,
+        )
         n = len(result.scores)
 
         if n == 0:
-            return [], 1.0
+            return [], 1.0, result
 
-        # Belief-entropy normalized to [0, 1] for the harness's confidence gate.
+        # Belief-entropy normalized to [0, 1] for reporting.
         b = np.asarray(result.belief, dtype=np.float64)
         bm = b[b > 0]
         entropy = float(-np.sum(bm * np.log(bm)) / np.log(n)) if n > 1 and len(bm) > 1 else 0.0
 
-        # Hard gate: if the agent loop did not converge, signal uninformative
-        # (the LLM should lead). Mirrors the single-shot scorer's gate-to-zero.
-        if not result.converged:
-            return [0.0] * n, 1.0
+        return list(result.scores), entropy, result
 
-        return list(result.scores), entropy
+    def _choice_token_sequences(
+        self,
+        choices: List[str],
+    ) -> Tuple[Dict[int, List[List[int]]], Dict[Tuple[int, ...], int]]:
+        """Tokenize exact answer choices for constrained local emission."""
+        sequences: Dict[int, List[List[int]]] = {}
+        seq_to_choice: Dict[Tuple[int, ...], int] = {}
+        for i, choice in enumerate(choices):
+            variants = [choice, f" {choice}", f"\n{choice}"]
+            seen: Set[Tuple[int, ...]] = set()
+            for variant in variants:
+                ids = self._tokenizer.encode(variant, add_special_tokens=False)
+                seq = tuple(int(t) for t in ids if int(t) >= 0)
+                if not seq or seq in seen:
+                    continue
+                seen.add(seq)
+                sequences.setdefault(i, []).append(list(seq))
+                seq_to_choice[seq] = i
+        return sequences, seq_to_choice
+
+    @staticmethod
+    def _choice_token_grounding(choice_sequences: Dict[int, List[List[int]]]) -> Dict[str, Set[int]]:
+        """Convert tokenized choices into hypothesis token sets for the live graft."""
+        grounding: Dict[str, Set[int]] = {}
+        for i, seqs in choice_sequences.items():
+            toks: Set[int] = set()
+            for seq in seqs:
+                toks.update(int(t) for t in seq)
+            grounding[f"H{i}"] = toks
+        return grounding
+
+    @staticmethod
+    def _belief_mapping(commit: Any, n_choices: int) -> Dict[str, float]:
+        vals = np.asarray(list(getattr(commit, "belief", []))[:n_choices], dtype=np.float64)
+        if vals.shape[0] != n_choices or not np.all(np.isfinite(vals)):
+            vals = np.full(n_choices, 1.0 / max(n_choices, 1), dtype=np.float64)
+        vals = np.maximum(vals, 0.0)
+        total = float(vals.sum())
+        if total <= 0.0:
+            vals = np.full(n_choices, 1.0 / max(n_choices, 1), dtype=np.float64)
+        else:
+            vals = vals / total
+        return {f"H{i}": float(vals[i]) for i in range(n_choices)}
+
+    @staticmethod
+    def _build_prefix_allowed_fn(
+        prompt_len: int,
+        choice_sequences: Dict[int, List[List[int]]],
+        eos_token_id: Optional[int],
+    ):
+        trie: Dict[int, Any] = {}
+        terminal = "_terminal"
+        for seqs in choice_sequences.values():
+            for seq in seqs:
+                node = trie
+                for token_id in seq:
+                    node = node.setdefault(int(token_id), {})
+                node[terminal] = True
+
+        def allowed(_batch_id: int, input_ids):
+            ids = input_ids.tolist() if hasattr(input_ids, "tolist") else list(input_ids)
+            generated = ids[prompt_len:]
+            if eos_token_id is not None and generated and generated[-1] == eos_token_id:
+                return [int(eos_token_id)]
+            node = trie
+            for token_id in generated:
+                token_id = int(token_id)
+                if token_id not in node:
+                    return [int(eos_token_id)] if eos_token_id is not None else []
+                node = node[token_id]
+            next_tokens = [int(k) for k in node.keys() if k != terminal]
+            if node.get(terminal) and eos_token_id is not None:
+                next_tokens.append(int(eos_token_id))
+            return next_tokens or ([int(eos_token_id)] if eos_token_id is not None else [])
+
+        return allowed
+
+    @staticmethod
+    def _parse_emitted_choice(
+        generated_ids: List[int],
+        seq_to_choice: Dict[Tuple[int, ...], int],
+        eos_token_id: Optional[int],
+    ) -> Optional[int]:
+        seq = [int(t) for t in generated_ids]
+        if eos_token_id is not None:
+            seq = [t for t in seq if t != int(eos_token_id)]
+        while seq and seq[-1] == 0:
+            seq.pop()
+        return seq_to_choice.get(tuple(seq))
+
+    def _emit_answer(
+        self,
+        sample: TaskSample,
+        commit: Any,
+    ) -> Tuple[int, str, str, Dict[str, Any]]:
+        """Emit the final local answer through live logit grafting."""
+        n = len(sample.choices)
+        committed_idx = int(getattr(commit, "committed_idx", -1))
+        if self.mode != "local" or n == 0:
+            text = sample.choices[committed_idx] if 0 <= committed_idx < n else ""
+            return committed_idx, text, "posterior_verbalizer", {}
+
+        self._init_model()
+        import torch
+        from transformers import LogitsProcessorList
+        from tensegrity.graft.logit_bias import TensegrityLogitsProcessor
+
+        choice_sequences, _ = self._choice_token_sequences(sample.choices)
+        if not choice_sequences:
+            raise ValueError("No tokenized answer choices available for local emission")
+        if 0 <= committed_idx < n and committed_idx in choice_sequences:
+            emission_sequences = {committed_idx: choice_sequences[committed_idx]}
+        else:
+            emission_sequences = choice_sequences
+        seq_to_choice = {
+            tuple(seq): i
+            for i, seqs in emission_sequences.items()
+            for seq in seqs
+        }
+
+        hypothesis_tokens = self._choice_token_grounding(choice_sequences)
+        beliefs = self._belief_mapping(commit, n)
+        model_config = getattr(self._model, "config", None)
+        model_vocab_size = getattr(model_config, "vocab_size", None)
+        vocab_size_attr = getattr(self._tokenizer, "vocab_size", None)
+        vocab_size = int(
+            model_vocab_size
+            if model_vocab_size is not None
+            else vocab_size_attr if vocab_size_attr is not None
+            else len(self._tokenizer)
+        )
+        processor = TensegrityLogitsProcessor(
+            hypothesis_tokens=hypothesis_tokens,
+            belief_fn=lambda: beliefs,
+            vocab_size=vocab_size,
+            scale=max(0.0, float(self.lam)) * 2.5,
+            suppress_threshold=0.0,
+            entropy_gate=1.01,
+            min_confidence=0.0,
+            async_beliefs=False,
+        )
+
+        choice_lines = "\n".join(f"- {choice}" for choice in sample.choices)
+        prompt = (
+            "Return exactly one answer choice and no explanation.\n\n"
+            f"Question:\n{sample.prompt}\n\n"
+            f"Choices:\n{choice_lines}\n\n"
+            "Answer:"
+        )
+        messages = [{"role": "user", "content": prompt}]
+        try:
+            attention_mask = None
+            if hasattr(self._tokenizer, "apply_chat_template"):
+                encoded = self._tokenizer.apply_chat_template(
+                    messages,
+                    return_tensors="pt",
+                    add_generation_prompt=True,
+                )
+                if isinstance(encoded, torch.Tensor):
+                    input_ids = encoded
+                elif hasattr(encoded, "input_ids"):
+                    input_ids = encoded.input_ids
+                    attention_mask = getattr(encoded, "attention_mask", None)
+                else:
+                    input_ids = encoded["input_ids"]
+                    attention_mask = encoded.get("attention_mask")
+                if attention_mask is None:
+                    attention_mask = torch.ones_like(input_ids)
+            else:
+                encoded = self._tokenizer(prompt, return_tensors="pt")
+                input_ids = encoded["input_ids"]
+                attention_mask = encoded.get("attention_mask")
+                if attention_mask is None:
+                    attention_mask = torch.ones_like(input_ids)
+
+            if hasattr(self._model, "device"):
+                input_ids = input_ids.to(self._model.device)
+                attention_mask = attention_mask.to(self._model.device)
+
+            eos_token_id = getattr(self._tokenizer, "eos_token_id", None)
+            pad_token_id = getattr(self._tokenizer, "pad_token_id", None) or eos_token_id
+            max_choice_len = max(len(seq) for seqs in emission_sequences.values() for seq in seqs)
+            prefix_allowed = self._build_prefix_allowed_fn(
+                prompt_len=int(input_ids.shape[1]),
+                choice_sequences=emission_sequences,
+                eos_token_id=eos_token_id,
+            )
+            outputs = self._model.generate(
+                input_ids,
+                attention_mask=attention_mask,
+                logits_processor=LogitsProcessorList([processor]),
+                prefix_allowed_tokens_fn=prefix_allowed,
+                max_new_tokens=max_choice_len + 1,
+                do_sample=False,
+                pad_token_id=pad_token_id,
+                eos_token_id=eos_token_id,
+            )
+            new_tokens = [int(t) for t in outputs[0][input_ids.shape[1]:].tolist()]
+            emitted_idx = self._parse_emitted_choice(new_tokens, seq_to_choice, eos_token_id)
+            emitted_text = self._tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
+            graft_state = {
+                "step": processor.state.step,
+                "bias_emitted": processor.state.bias_emitted,
+                "belief_entropy": processor.state.belief_entropy,
+                "convergence_met": processor.state.convergence_met,
+                "max_bias_magnitude": processor.state.max_bias_magnitude,
+                "boosted_tokens": processor.state.boosted_tokens,
+                "suppressed_tokens": processor.state.suppressed_tokens,
+                "beliefs": beliefs,
+            }
+            if emitted_idx is None:
+                emitted_idx = committed_idx
+                return emitted_idx, emitted_text, "logit_grafted_unparsed_commit", graft_state
+            return int(emitted_idx), emitted_text, "logit_grafted_verbalizer", graft_state
+        finally:
+            processor.close()
 
     def evaluate_sample(self, sample: TaskSample) -> SampleResult:
-        """Evaluate a single sample with confidence-gated blending."""
+        """Evaluate one sample through the persistent integrated agent."""
         t0 = time.time()
         n = len(sample.choices)
-
-        tensegrity_scores, entropy = self._get_tensegrity_scores(sample)
-
-        scores_arr = np.array(tensegrity_scores)
-        score_spread = float(scores_arr.max() - scores_arr.min()) if len(scores_arr) > 0 else 0.0
-        bias_magnitude = score_spread
-        bias_applied = score_spread > 0.01
 
         if self.mode == "local":
             self._init_model()
@@ -373,64 +581,26 @@ class EvalRunner:
             rng = np.random.RandomState(sample_seed)
             baseline_scores = rng.randn(n).tolist()
 
-        # === CONFIDENCE-GATED BLENDING ===
-        base_arr = np.array(baseline_scores)
-
-        if self.mode == "local":
-            # LLM confidence from softmax entropy
-            shifted_base = base_arr - base_arr.max()
-            base_probs = np.exp(shifted_base)
-            base_probs_sum = base_probs.sum()
-            base_probs = base_probs / base_probs_sum if base_probs_sum > 0 else np.ones(n) / n
-
-            if n > 1:
-                base_entropy = float(-np.sum(base_probs * np.log(base_probs + 1e-16)))
-                max_entropy = float(np.log(n))
-                llm_norm_entropy = base_entropy / max_entropy if max_entropy > 0 else 0.0
-            else:
-                llm_norm_entropy = 0.0
-
-            llm_confidence = 1.0 - llm_norm_entropy
-
-            # Gate: if LLM is confident, don't interfere
-            confidence_gate_threshold = 0.6
-
-            if llm_confidence > confidence_gate_threshold:
-                effective_lam = 0.0
-                bias_applied = False
-            else:
-                uncertainty_scale = (1.0 - llm_confidence / confidence_gate_threshold)
-                effective_lam = self.lam * uncertainty_scale
-
-            # Scale graft relative to LLM score range (0.3× = gentle nudge)
-            base_spread = float(base_arr.max() - base_arr.min())
-
-            if base_spread > 1e-8 and bias_applied:
-                t_std = float(scores_arr.std())
-                if t_std > 1e-8:
-                    normalized_t = [(s - float(scores_arr.mean())) / t_std * base_spread * 0.3
-                                    for s in tensegrity_scores]
-                else:
-                    normalized_t = [0.0] * n
-            else:
-                normalized_t = [0.0] * n
-        else:
-            # Offline: simple z-normalization
-            effective_lam = self.lam
-
-            if bias_applied and score_spread > 0:
-                t_std = float(scores_arr.std())
-                if t_std > 1e-8:
-                    normalized_t = [(s - float(scores_arr.mean())) / t_std for s in tensegrity_scores]
-                else:
-                    normalized_t = [0.0] * n
-            else:
-                normalized_t = [0.0] * n
-
-        grafted_scores = [b + effective_lam * t for b, t in zip(baseline_scores, normalized_t)]
-
+        tensegrity_scores, entropy, commit = self._get_tensegrity_scores(
+            sample,
+            linguistic_scores=baseline_scores if self.mode == "local" else None,
+        )
+        scores_arr = np.array(tensegrity_scores, dtype=np.float64)
+        score_spread = float(scores_arr.max() - scores_arr.min()) if len(scores_arr) > 0 else 0.0
+        bias_magnitude = score_spread
+        bias_applied = True
+        grafted_scores = list(tensegrity_scores)
         baseline_pred = int(np.argmax(baseline_scores))
-        grafted_pred = int(np.argmax(grafted_scores))
+        try:
+            grafted_pred, emitted_answer, emission_mode, emission_graft_state = self._emit_answer(
+                sample, commit
+            )
+        except Exception as e:
+            logger.warning("Integrated answer emission failed; using committed posterior: %s", e)
+            grafted_pred = int(commit.committed_idx)
+            emitted_answer = sample.choices[grafted_pred] if 0 <= grafted_pred < n else ""
+            emission_mode = "emission_error_commit"
+            emission_graft_state = {"error": str(e)}
         baseline_correct = (baseline_pred == sample.gold)
         grafted_correct = (grafted_pred == sample.gold)
 
@@ -443,7 +613,7 @@ class EvalRunner:
         else:
             flip_type = "neutral"
 
-        return SampleResult(
+        sample_result = SampleResult(
             sample_id=sample.id, task=sample.metadata.get("task", ""),
             gold=sample.gold, n_choices=n,
             baseline_pred=baseline_pred, grafted_pred=grafted_pred,
@@ -452,7 +622,12 @@ class EvalRunner:
             tensegrity_scores=tensegrity_scores, graft_entropy=entropy,
             bias_applied=bias_applied, bias_magnitude=bias_magnitude,
             flip_type=flip_type, lam=self.lam, wall_time=time.time() - t0,
+            emitted_answer=emitted_answer, emission_mode=emission_mode,
+            emission_graft_state=emission_graft_state,
         )
+        if hasattr(self, "_canonical"):
+            self._canonical.learn_from_feedback(sample, grafted_pred)
+        return sample_result
 
     def evaluate_task(
         self, task_name: str, max_samples: Optional[int] = None, verbose: bool = False,
@@ -462,17 +637,6 @@ class EvalRunner:
 
         if verbose:
             print(f"  [{task_name}] Loaded {len(samples)} samples")
-
-        # Start a fresh memory session per task: episodic + Hopfield + energy
-        # arena wiped, so cross-item learning operates within a task but
-        # doesn't leak priors across tasks (different label spaces).
-        if hasattr(self, "_canonical") and hasattr(self._canonical, "reset_session"):
-            self._canonical.reset_session()
-        if hasattr(self, "_field_scorer"):
-            if hasattr(self._field_scorer, "reset_session"):
-                self._field_scorer.reset_session()
-            elif hasattr(self._field_scorer, "reset"):
-                self._field_scorer.reset()
 
         results = []
         for i, sample in enumerate(samples):

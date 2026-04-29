@@ -3,9 +3,10 @@ Canonical Tensegrity pipeline — the agent loop.
 
 This is the unified entry point for benchmarks AND chat. The cognitive layer
 is the agent; the LLM (when used) is a typed tool exposed only via Broca.
-For multiple-choice scoring, the LLM is not in the reasoning path at all —
-the agent commits an answer through iterative perception, falsification,
-causal model competition, and memory retrieval.
+For multiple-choice scoring, LLM choice likelihoods are treated as one sensory
+evidence channel inside the agent's posterior update. The final answer is the
+agent's commitment after predictive-coding falsification, causal competition,
+memory retrieval, and linguistic evidence have been integrated.
 
 Wired subsystems (every component the project ships):
   • CognitiveController     — agent body, owns BeliefState (per-hypothesis posteriors)
@@ -31,8 +32,10 @@ from __future__ import annotations
 
 import logging
 import math
+import pickle
 import re
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -77,6 +80,8 @@ class CommitResult:
     final_energy_arena_tension: float
     trace: List[IterationStep] = field(default_factory=list)
     initial_perception: Optional[Dict[str, Any]] = None
+    linguistic_scores: Optional[List[float]] = None
+    memory_scores: Optional[List[float]] = None
 
 
 def _alphanum_tokens(text: str, max_tokens: int) -> List[str]:
@@ -108,17 +113,18 @@ class CanonicalPipeline:
               derived from the iteration's belief variance, not a magic number).
       4. Commit: argmax of the controller's belief state.
 
-    Per-task flow:
-      reset_session — full clear (episodic memory, energy arena, Hopfield, etc).
-      The bench runner calls this between tasks so cross-item learning operates
-      within a task but doesn't leak across tasks (which have different label
-      spaces).
+    Persistent flow:
+      The benchmark runner keeps this pipeline alive across tasks and runs.
+      Per-item hypothesis slots are rewritten, but field weights, episodic
+      memory, Hopfield attractors, epistemic counts, and the agent causal arena
+      persist unless reset_session is called explicitly.
     """
 
     def __init__(
         self,
         hypothesis_labels: Optional[List[str]] = None,
         *,
+        broca: Optional[Any] = None,
         use_llm_broca: bool = False,
         enable_hypothesis_generation: bool = False,
         model_name: str = "meta-llama/Llama-3.2-1B-Instruct",
@@ -137,12 +143,30 @@ class CanonicalPipeline:
         energy_arena_precision: float = 1.0,
         # Energy-arena selection temperature (1.0 = uniform softmax).
         energy_arena_beta: float = 1.0,
+        # Fixed hypothesis width keeps one agent alive across tasks with
+        # different choice counts. Unused slots are zero-probability padding.
+        max_hypotheses: int = 8,
+        # LLM likelihoods enter the posterior as a sensory-evidence channel.
+        llm_evidence_weight: float = 1.0,
+        # Persistent episodic recall enters as a memory-evidence channel.
+        memory_evidence_weight: float = 0.75,
+        feedback_learning_rate: float = 1.0,
+        persistent_state_path: Optional[str] = None,
     ):
         self.model_name = model_name
         self.max_iterations = max(1, int(max_iterations))
         self.commit_ratio = float(commit_ratio)
         self.falsify_settle_steps = int(falsify_settle_steps)
         self.falsify_update_strength = float(falsify_update_strength)
+        self.max_hypotheses = max(2, int(max_hypotheses))
+        self.llm_evidence_weight = float(llm_evidence_weight)
+        self.memory_evidence_weight = float(memory_evidence_weight)
+        self.feedback_learning_rate = float(feedback_learning_rate)
+        self.persistent_state_path = persistent_state_path
+
+        initial_labels = list(hypothesis_labels or [])
+        while len(initial_labels) < self.max_hypotheses:
+            initial_labels.append(f"_empty_{len(initial_labels)}")
 
         # The agent body. controller.agent runs the full stack:
         #   UnifiedField (FHRR + NGC + Hopfield) + FreeEnergyEngine
@@ -151,9 +175,10 @@ class CanonicalPipeline:
         # Broca, when enabled, parses input into typed structure and proposes
         # SCMs when causal tension is high (handled inside perceive_only).
         self.controller = CognitiveController(
-            n_hypotheses=max(len(hypothesis_labels) if hypothesis_labels else 2, 2),
-            hypothesis_labels=hypothesis_labels,
-            use_llm=use_llm_broca,
+            n_hypotheses=len(initial_labels),
+            hypothesis_labels=initial_labels,
+            broca=broca,
+            use_llm=use_llm_broca or broca is not None,
             enable_hypothesis_generation=enable_hypothesis_generation,
         )
 
@@ -173,6 +198,11 @@ class CanonicalPipeline:
 
         # Track item index for episodic encoding metadata.
         self._item_index = 0
+        self._choice_model_names: List[str] = []
+        self._last_derived_obs: List[Dict[str, int]] = []
+
+        if self.persistent_state_path:
+            self.load_state(self.persistent_state_path)
 
     # ---------- session boundaries ----------
 
@@ -213,7 +243,7 @@ class CanonicalPipeline:
         existing = self.controller.belief_state.hypotheses
         existing_n = len(existing)
         # Pad/truncate labels to match the hypothesis space.
-        target_n = max(len(labels), 2)
+        target_n = max(existing_n, len(labels), self.max_hypotheses, 2)
         while len(labels) < target_n:
             labels.append(f"_empty_{len(labels)}")
 
@@ -229,10 +259,13 @@ class CanonicalPipeline:
             beta=self.energy_arena.beta,
         )
         self._scm_topologies = {}
-        for i, label in enumerate(labels):
+        self._choice_model_names = []
+        self._last_derived_obs = []
+        for i, label in enumerate(labels[:len(sample.choices)]):
             scm = self._build_choice_scm(i, label)
             try:
                 self.energy_arena.register(scm)
+                self._choice_model_names.append(scm.name)
                 # Project this SCM's DAG into the NGC layer hierarchy via
                 # TopologyMapper. Horizontal causal edges are resolved through
                 # virtual parents at higher levels (the "elevator shaft" fix).
@@ -251,13 +284,15 @@ class CanonicalPipeline:
 
         # Fresh hypotheses with uniform prior over the choice labels.
         n = len(labels)
+        active = [not label.startswith("_empty_") for label in labels]
+        n_active = max(1, sum(active))
         self.controller.belief_state = BeliefState(
             turn=0,
             hypotheses=[
                 Hypothesis(
                     id=f"H{i}",
                     description=label,
-                    probability=1.0 / n,
+                    probability=(1.0 / n_active if active[i] else 0.0),
                     supporting_evidence=[],
                     contradicting_evidence=[],
                 )
@@ -422,7 +457,7 @@ class CanonicalPipeline:
 
         posterior = np.zeros(n_choices, dtype=np.float64)
         for i in range(n_choices):
-            name = f"choice_{i}"
+            name = self._choice_model_names[i] if i < len(self._choice_model_names) else f"choice_{i}"
             term = self.energy_arena.models.get(name)
             if term is None:
                 continue
@@ -447,16 +482,21 @@ class CanonicalPipeline:
             ent = float(-np.sum(nz * np.log(nz)) / np.log(n_choices))
         else:
             ent = 0.0
-        winner = f"choice_{int(np.argmax(weights))}"
+        winner_idx = int(np.argmax(weights))
+        winner = (
+            self._choice_model_names[winner_idx]
+            if winner_idx < len(self._choice_model_names)
+            else f"choice_{winner_idx}"
+        )
         return weights, ent, winner
 
     # ---------- belief integration ----------
 
     def _belief_from_controller(self, n_choices: int) -> np.ndarray:
         hs = self.controller.belief_state.hypotheses
-        if len(hs) != n_choices:
+        if len(hs) < n_choices:
             return np.full(n_choices, 1.0 / n_choices)
-        p = np.array([float(h.probability) for h in hs], dtype=np.float64)
+        p = np.array([float(h.probability) for h in hs[:n_choices]], dtype=np.float64)
         s = p.sum()
         if s <= 0:
             return np.full(n_choices, 1.0 / n_choices)
@@ -466,10 +506,12 @@ class CanonicalPipeline:
         """Write a belief vector back into the controller's hypothesis posteriors
         so subsequent controller-level operations see the updated state."""
         hs = self.controller.belief_state.hypotheses
-        if len(hs) != len(belief):
+        if len(hs) < len(belief):
             return
-        for h, p in zip(hs, belief):
+        for h, p in zip(hs[:len(belief)], belief):
             h.probability = float(max(p, 0.0))
+        for h in hs[len(belief):]:
+            h.probability = 0.0
         # Renormalize defensively.
         total = sum(h.probability for h in hs)
         if total > 0:
@@ -494,7 +536,11 @@ class CanonicalPipeline:
 
     # ---------- main entry: score one item ----------
 
-    def score_multichoice(self, sample: TaskSample) -> CommitResult:
+    def score_multichoice(
+        self,
+        sample: TaskSample,
+        linguistic_scores: Optional[List[float]] = None,
+    ) -> CommitResult:
         n = len(sample.choices)
         if n == 0:
             return CommitResult(
@@ -507,9 +553,17 @@ class CanonicalPipeline:
         self.reset_for_item(sample)
         self._item_index += 1
 
+        if linguistic_scores is not None and len(linguistic_scores) == n:
+            linguistic = np.asarray(linguistic_scores, dtype=np.float64)
+            if not np.all(np.isfinite(linguistic)):
+                linguistic = np.zeros(n, dtype=np.float64)
+        else:
+            linguistic = np.zeros(n, dtype=np.float64)
+
         # Initial perception — runs the full stack, including Broca SCM proposal
         # if causal tension is high (the controller wires this internally).
         initial_perception = self.ingest_prompt(sample.prompt)
+        memory_scores = self._memory_choice_scores(sample)
 
         trace: List[IterationStep] = []
         converged = False
@@ -527,8 +581,9 @@ class CanonicalPipeline:
             #    the per-choice models actually differentiate. (Dirichlet
             #    counts in the per-choice SCM CPTs; no gradients.) Then
             #    compete on energy.
+            self._last_derived_obs = list(derived_obs)
             for i in range(n):
-                name = f"choice_{i}"
+                name = self._choice_model_names[i] if i < len(self._choice_model_names) else f"choice_{i}"
                 term = self.energy_arena.models.get(name)
                 if term is None:
                     continue
@@ -544,10 +599,14 @@ class CanonicalPipeline:
             #    new_p_i ∝ old_p_i * exp(strength * z(falsify_i)) * energy_post_i.
             old_belief = self._belief_from_controller(n)
             fz = self._znorm(falsify)
+            lz = self._znorm(linguistic)
+            mz = self._znorm(memory_scores)
             log_lik_falsify = self.falsify_update_strength * fz
             log_post = (
                 np.log(np.maximum(old_belief, 1e-12))
                 + log_lik_falsify
+                + self.llm_evidence_weight * lz
+                + self.memory_evidence_weight * mz
                 + np.log(np.maximum(energy_post, 1e-12))
             )
             log_post -= log_post.max()
@@ -622,9 +681,200 @@ class CanonicalPipeline:
             final_energy_arena_tension=final_energy_tension,
             trace=trace,
             initial_perception=initial_perception if n > 0 else None,
+            linguistic_scores=linguistic.tolist(),
+            memory_scores=memory_scores.tolist(),
         )
 
     # ---------- helpers ----------
+
+    def _encode_text_fhrr(self, text: str, max_tokens: int = 96) -> np.ndarray:
+        field = self.controller.agent.field
+        return field.encoder.encode_sequence(_alphanum_tokens(text, max_tokens=max_tokens))
+
+    @staticmethod
+    def _unit_real(vec: np.ndarray) -> np.ndarray:
+        v = np.real(vec).astype(np.float64)
+        norm = np.linalg.norm(v)
+        return v / norm if norm > 1e-10 else v
+
+    def _memory_choice_scores(self, sample: TaskSample) -> np.ndarray:
+        """Retrieve prior successful episodes and score choices by similarity.
+
+        This is the persistent memory channel inside the same posterior update
+        as predictive-coding falsification, causal energy, and LLM evidence.
+        """
+        n = len(sample.choices)
+        scores = np.zeros(n, dtype=np.float64)
+        if n == 0:
+            return scores
+
+        episodic = getattr(self.controller.agent, "episodic", None)
+        if episodic is None or not getattr(episodic, "episodes", None):
+            return scores
+
+        field = self.controller.agent.field
+        prompt_fhrr = self._encode_text_fhrr(sample.prompt, max_tokens=96)
+        prompt_obs = field._fhrr_to_obs(prompt_fhrr)
+        query_belief = np.full(n, 1.0 / n, dtype=np.float64)
+
+        try:
+            query_ctx = episodic.compute_item_representation(prompt_obs, query_belief)
+            retrieved = episodic.retrieve_by_context(query_context=query_ctx, k=8)
+        except Exception as e:
+            logger.debug("persistent episodic retrieval skipped: %s", e)
+            return scores
+
+        if not retrieved:
+            return scores
+
+        choice_vecs = [
+            self._unit_real(self._encode_text_fhrr(choice, max_tokens=48))
+            for choice in sample.choices
+        ]
+        for ep in retrieved:
+            meta = getattr(ep, "metadata", {}) or {}
+            correct_vec = meta.get("correct_fhrr_real")
+            if correct_vec is None:
+                continue
+            correct_vec = np.asarray(correct_vec, dtype=np.float64)
+            cn = np.linalg.norm(correct_vec)
+            if cn <= 1e-10:
+                continue
+            correct_vec = correct_vec / cn
+            ctx_sim = float(np.dot(query_ctx, ep.context_vector))
+            if ctx_sim <= 0.0:
+                continue
+            confidence = 1.0 - float(ep.surprise)
+            weight = ctx_sim * max(0.05, confidence)
+            for i, choice_vec in enumerate(choice_vecs):
+                scores[i] += weight * float(np.dot(choice_vec, correct_vec))
+
+        return scores
+
+    def learn_from_feedback(self, sample: TaskSample, committed_idx: int) -> Dict[str, Any]:
+        """Use benchmark outcome as post-action feedback and persist learning.
+
+        The gold label is deliberately consumed only after commitment. It
+        updates episodic memory, Hopfield attractors, NGC weights, epistemic
+        counts, and the item-local SCM that corresponded to the revealed
+        correct action.
+        """
+        n = len(sample.choices)
+        if n == 0 or sample.gold < 0 or sample.gold >= n:
+            return {"learned": False, "reason": "invalid sample"}
+
+        correct = int(committed_idx) == int(sample.gold)
+        field = self.controller.agent.field
+        prompt_fhrr = self._encode_text_fhrr(sample.prompt, max_tokens=96)
+        correct_fhrr = self._encode_text_fhrr(
+            f"{sample.prompt} {sample.choices[sample.gold]}",
+            max_tokens=128,
+        )
+        prompt_obs = field._fhrr_to_obs(prompt_fhrr)
+        correct_obs = field._fhrr_to_obs(correct_fhrr)
+
+        try:
+            field.ngc.settle(correct_obs, steps=max(1, self.falsify_settle_steps))
+            field.ngc.learn(modulation=max(0.0, self.feedback_learning_rate))
+            field.memory.store(field.ngc.get_abstract_state(level=-1))
+        except Exception as e:
+            logger.debug("feedback NGC learning skipped: %s", e)
+
+        belief_width = max(self.controller.agent.n_states, self.max_hypotheses, n)
+        feedback_vec = np.zeros(belief_width, dtype=np.float64)
+        feedback_vec[sample.gold] = 1.0
+        if not correct and 0 <= committed_idx < n:
+            feedback_vec[committed_idx] = -1.0
+
+        try:
+            self.controller.agent.perceive(feedback_vec[:self.controller.agent.n_states])
+        except Exception as e:
+            logger.debug("feedback perception skipped: %s", e)
+
+        belief = np.zeros(n, dtype=np.float64)
+        belief[sample.gold] = 1.0
+        try:
+            self.controller.agent.episodic.encode(
+                observation=prompt_obs,
+                morton_code=np.array([sample.gold], dtype=np.int64),
+                belief_state=belief,
+                action=int(sample.gold),
+                surprise=0.0 if correct else 1.0,
+                free_energy=0.0,
+                metadata={
+                    "task": sample.metadata.get("task", ""),
+                    "sample_id": sample.id,
+                    "prediction": int(committed_idx),
+                    "gold": int(sample.gold),
+                    "correct": bool(correct),
+                    "correct_text": sample.choices[sample.gold],
+                    "correct_fhrr_real": self._unit_real(correct_fhrr),
+                },
+            )
+        except Exception as e:
+            logger.debug("feedback episodic encode skipped: %s", e)
+
+        if self._last_derived_obs and 0 <= sample.gold < len(self._last_derived_obs):
+            name = (
+                self._choice_model_names[sample.gold]
+                if sample.gold < len(self._choice_model_names)
+                else None
+            )
+            term = self.energy_arena.models.get(name) if name else None
+            if term is not None:
+                try:
+                    term.scm.update_from_data([self._last_derived_obs[sample.gold]])
+                except Exception as e:
+                    logger.debug("feedback SCM update skipped: %s", e)
+
+        try:
+            self.controller.agent.experience_replay(n_episodes=3)
+        except Exception as e:
+            logger.debug("feedback replay skipped: %s", e)
+
+        if self.persistent_state_path:
+            self.save_state(self.persistent_state_path)
+
+        return {"learned": True, "correct": bool(correct)}
+
+    def save_state(self, path: Optional[str] = None) -> None:
+        target = Path(path or self.persistent_state_path or "")
+        if not str(target):
+            return
+        target.parent.mkdir(parents=True, exist_ok=True)
+        state = {
+            "version": 1,
+            "item_index": self._item_index,
+            "agent": self.controller.agent,
+            "belief_state": self.controller.belief_state,
+            "conversation": list(self.controller._conversation),
+            "max_hypotheses": self.max_hypotheses,
+        }
+        with target.open("wb") as f:
+            pickle.dump(state, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+    def load_state(self, path: Optional[str] = None) -> bool:
+        target = Path(path or self.persistent_state_path or "")
+        if not str(target) or not target.exists():
+            return False
+        try:
+            with target.open("rb") as f:
+                state = pickle.load(f)
+        except Exception as e:
+            logger.warning("Could not load persistent state %s: %s", target, e)
+            return False
+        if not isinstance(state, dict) or state.get("version") != 1:
+            logger.warning("Ignoring unsupported persistent state %s", target)
+            return False
+        agent = state.get("agent")
+        if agent is not None:
+            self.controller.agent = agent
+        belief_state = state.get("belief_state")
+        if belief_state is not None:
+            self.controller.belief_state = belief_state
+        self.controller._conversation = list(state.get("conversation", []))
+        self._item_index = int(state.get("item_index", 0))
+        return True
 
     @staticmethod
     def _znorm(a: np.ndarray) -> np.ndarray:
