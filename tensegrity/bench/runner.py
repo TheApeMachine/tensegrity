@@ -322,13 +322,20 @@ class EvalRunner:
                 model_name=self.model_name,
                 max_iterations=3,
                 commit_ratio=2.0,
-                falsify_settle_steps=15,
-                falsify_update_strength=1.0,
+                falsify_settle_steps=20,
+                # Dampened from 1.0: NGC falsification scores on randomly-projected
+                # FHRR observations are noisy; high strength amplifies noise into
+                # confident wrong beliefs through the Bayesian update.
+                falsify_update_strength=0.3,
                 energy_arena_precision=1.0,
-                energy_arena_beta=1.0,
+                # Dampened from 1.0: per-choice SCMs start with uniform CPTs and
+                # get ~1 observation per iteration — their energy posterior is
+                # nearly uniform and contributes noise, not signal.
+                energy_arena_beta=0.1,
                 max_hypotheses=8,
                 llm_evidence_weight=self.lam,
                 memory_evidence_weight=0.75,
+                sbert_evidence_weight=0.8,
                 persistent_state_path=self.state_path,
             )
         else:
@@ -485,10 +492,19 @@ class EvalRunner:
             hypothesis_tokens=hypothesis_tokens,
             belief_fn=lambda: beliefs,
             vocab_size=vocab_size,
-            scale=max(0.0, float(self.lam)) * 2.5,
+            # Reduced from scale=lam*2.5: the previous aggressive scaling
+            # overpowered LLM logits even when the cognitive layer had low
+            # confidence, causing universal regressions in local mode.
+            scale=max(0.0, float(self.lam)) * 0.5,
             suppress_threshold=0.0,
-            entropy_gate=1.01,
-            min_confidence=0.0,
+            # Tightened from 1.01 (always emit) to 0.65: only emit logit bias
+            # when the cognitive layer has genuinely converged. When entropy is
+            # high (beliefs are near-uniform), the LLM's own logits are
+            # preserved — "never worse than base."
+            entropy_gate=0.65,
+            # Raised from 0.0 to 0.4: require the leading hypothesis to have
+            # at least 40% mass before emitting any bias.
+            min_confidence=0.4,
             async_beliefs=False,
         )
 

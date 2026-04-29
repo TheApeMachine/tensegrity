@@ -419,10 +419,13 @@ class CognitiveController:
         
         # Linguistic confidence modulates the whole vector
         features *= parsed.confidence_linguistic
-        
-        # Negation flips the sign
-        if parsed.negation_present:
-            features *= -0.5
+
+        # NOTE: Global negation flip removed. Negation is already handled
+        # per-relation inside _apply_relation_evidence() via the `negated`
+        # flag on each RelationMention. The blanket sign flip was causing
+        # catastrophic regressions on tasks with passages containing negation
+        # words (BoolQ: −23%) because unrelated negation in the passage would
+        # flip evidence for/against all hypotheses indiscriminately.
         
         return features
     

@@ -150,6 +150,10 @@ class CanonicalPipeline:
         llm_evidence_weight: float = 1.0,
         # Persistent episodic recall enters as a memory-evidence channel.
         memory_evidence_weight: float = 0.75,
+        # SBERT sentence similarity enters as a semantic-evidence channel.
+        # This is the strongest signal source: it compares the prompt against
+        # each (prompt+choice) concatenation using frozen sentence embeddings.
+        sbert_evidence_weight: float = 0.8,
         feedback_learning_rate: float = 1.0,
         persistent_state_path: Optional[str] = None,
     ):
@@ -161,6 +165,7 @@ class CanonicalPipeline:
         self.max_hypotheses = max(2, int(max_hypotheses))
         self.llm_evidence_weight = float(llm_evidence_weight)
         self.memory_evidence_weight = float(memory_evidence_weight)
+        self.sbert_evidence_weight = float(sbert_evidence_weight)
         self.feedback_learning_rate = float(feedback_learning_rate)
         self.persistent_state_path = persistent_state_path
 
@@ -564,6 +569,7 @@ class CanonicalPipeline:
         # if causal tension is high (the controller wires this internally).
         initial_perception = self.ingest_prompt(sample.prompt)
         memory_scores = self._memory_choice_scores(sample)
+        sbert_scores = self._sbert_choice_scores(sample)
 
         trace: List[IterationStep] = []
         converged = False
@@ -601,12 +607,14 @@ class CanonicalPipeline:
             fz = self._znorm(falsify)
             lz = self._znorm(linguistic)
             mz = self._znorm(memory_scores)
+            sz = self._znorm(sbert_scores)
             log_lik_falsify = self.falsify_update_strength * fz
             log_post = (
                 np.log(np.maximum(old_belief, 1e-12))
                 + log_lik_falsify
                 + self.llm_evidence_weight * lz
                 + self.memory_evidence_weight * mz
+                + self.sbert_evidence_weight * sz
                 + np.log(np.maximum(energy_post, 1e-12))
             )
             log_post -= log_post.max()
@@ -696,6 +704,47 @@ class CanonicalPipeline:
         v = np.real(vec).astype(np.float64)
         norm = np.linalg.norm(v)
         return v / norm if norm > 1e-10 else v
+
+    def _sbert_choice_scores(self, sample: TaskSample) -> np.ndarray:
+        """Score choices by SBERT sentence-level cosine similarity.
+
+        This is the strongest semantic signal: it compares the prompt against
+        each choice using frozen sentence embeddings from a pretrained SBERT
+        model. Unlike the NGC falsification path, this signal is NOT destroyed
+        by the random FHRR→obs projection and directly measures semantic
+        relatedness in the original embedding space.
+        """
+        n = len(sample.choices)
+        scores = np.zeros(n, dtype=np.float64)
+        if n == 0:
+            return scores
+
+        field = self.controller.agent.field
+        features = field.encoder.features
+        # Try to get the SBERT model from the semantic codebook
+        getter = getattr(features, "get_sbert_model", None)
+        sbert = getter() if callable(getter) else None
+        if sbert is None:
+            return scores
+
+        try:
+            texts = [sample.prompt] + [
+                f"{sample.prompt} {c}" for c in sample.choices
+            ]
+            embs = sbert.encode(texts, show_progress_bar=False)
+            pe = embs[0]
+            pn = float(np.linalg.norm(pe))
+            if pn < 1e-8:
+                return scores
+            for i in range(n):
+                ce = embs[i + 1]
+                cn = float(np.linalg.norm(ce))
+                if cn > 1e-8:
+                    scores[i] = float(np.dot(pe, ce) / (pn * cn))
+        except Exception as e:
+            logger.debug("SBERT choice scoring failed: %s", e)
+
+        return scores
 
     def _memory_choice_scores(self, sample: TaskSample) -> np.ndarray:
         """Retrieve prior successful episodes and score choices by similarity.
