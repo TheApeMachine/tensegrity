@@ -226,16 +226,6 @@ class CanonicalPipeline:
         self._choice_model_names: List[str] = []
         self._last_derived_obs: List[Dict[str, int]] = []
 
-        # --- Persistent causal knowledge ---
-        # Domain-level SCMs persist across items within a task. Instead of
-        # rebuilding every SCM from scratch per item (which gives uniform CPTs
-        # that contribute noise), we maintain a library of domain SCMs keyed
-        # by task domain. When a new item arrives, we look up existing SCMs
-        # for that domain and re-register them with accumulated experience.
-        # Per-choice ephemeral SCMs are still created, but the domain SCM
-        # provides a prior that shapes the per-choice energy competition.
-        self._domain_scm_library: Dict[str, StructuralCausalModel] = {}
-
         if self.persistent_state_path:
             self.load_state(self.persistent_state_path)
 
@@ -296,15 +286,14 @@ class CanonicalPipeline:
         self._scm_topologies = {}
         self._choice_model_names = []
         self._last_derived_obs = []
-
-        # Determine domain for persistent SCM lookup
-        domain = sample.metadata.get("domain", "general")
-
         for i, label in enumerate(labels[:len(sample.choices)]):
-            scm = self._build_choice_scm(i, label, domain=domain)
+            scm = self._build_choice_scm(i, label)
             try:
                 self.energy_arena.register(scm)
                 self._choice_model_names.append(scm.name)
+                # Project this SCM's DAG into the NGC layer hierarchy via
+                # TopologyMapper. Horizontal causal edges are resolved through
+                # virtual parents at higher levels (the "elevator shaft" fix).
                 n_ngc_layers = len(self.controller.agent.field.ngc.layer_sizes)
                 topology = self._topology_mapper.from_scm(scm, n_layers=n_ngc_layers)
                 self._scm_topologies[scm.name] = topology
@@ -356,46 +345,23 @@ class CanonicalPipeline:
 
     # ---------- per-choice SCM (used by EnergyCausalArena) ----------
 
-    def _build_choice_scm(self, choice_idx: int, label: str,
-                          domain: str = "general") -> StructuralCausalModel:
+    def _build_choice_scm(self, choice_idx: int, label: str) -> StructuralCausalModel:
         """
-        Build a per-choice SCM, seeded with persistent domain knowledge.
+        Build a tiny SCM for one choice:
 
-        The structure is always:
             prompt_feature  ──▶  choice_match  ──▶  observation
                                                 ▲
                                                 │ (lateral) coherence
 
-        But CPTs are initialized from the domain SCM library if a matching
-        domain model exists. This means the per-choice SCMs start with
-        accumulated experience from prior items in the same domain, not
-        uniform Dirichlet priors. The domain model is the persistent
-        causal knowledge that survives across items.
+        The DAG has both vertical and horizontal edges. The TopologyMapper
+        is exactly what turns the lateral coherence link into a virtual parent
+        in the NGC hierarchy, addressing the topological-mismatch critique.
         """
         scm = StructuralCausalModel(name=f"choice_{choice_idx}_{label}")
         scm.add_variable("prompt_feature", n_values=4, parents=[])
         scm.add_variable("coherence", n_values=4, parents=[])
         scm.add_variable("choice_match", n_values=4, parents=["prompt_feature"])
         scm.add_variable("observation", n_values=4, parents=["choice_match", "coherence"])
-
-        # Seed from domain library if available
-        domain_key = f"domain_{domain}"
-        if domain_key in self._domain_scm_library:
-            domain_scm = self._domain_scm_library[domain_key]
-            # Copy accumulated CPTs from the domain model
-            for var_name, mech in scm.mechanisms.items():
-                domain_mech = domain_scm.mechanisms.get(var_name)
-                if domain_mech is not None and mech.cpt.shape == domain_mech.cpt.shape:
-                    mech.cpt[:] = domain_mech.cpt
-        else:
-            # Create a new domain SCM for future seeding
-            domain_scm = StructuralCausalModel(name=domain_key)
-            domain_scm.add_variable("prompt_feature", n_values=4, parents=[])
-            domain_scm.add_variable("coherence", n_values=4, parents=[])
-            domain_scm.add_variable("choice_match", n_values=4, parents=["prompt_feature"])
-            domain_scm.add_variable("observation", n_values=4, parents=["choice_match", "coherence"])
-            self._domain_scm_library[domain_key] = domain_scm
-
         return scm
 
     # ---------- one-shot ingest (delegates to controller) ----------
@@ -421,61 +387,73 @@ class CanonicalPipeline:
         self, prompt: str, choices: List[str]
     ) -> Tuple[np.ndarray, List[Dict[str, int]]]:
         """
-        For each choice c_i:
-          1. Save NGC base state (prompt-grounded after perceive).
-          2. Encode c_i alone, settle NGC under it.
-          3. Ask the field to top-down predict the prompt observation.
-          4. score_i = -prediction_error.
-          5. Discretize the obs/pred for use as energy-arena observations.
+        Real falsification in SBERT embedding space.
 
-        Returns (scores, energy_arena_observations).
+        For each choice c_i:
+          1. Save NGC state after settling on the prompt.
+          2. Get SBERT embedding of choice c_i.
+          3. Settle NGC on the choice embedding.
+          4. Ask NGC to predict what layer 0 should look like (top-down).
+          5. score_i = -||prediction - prompt_embedding||²
+
+        This is genuine falsification: "if the answer is c_i, and the NGC
+        has learned the structure of how answers relate to questions in
+        embedding space, does c_i's abstract state predict the prompt?"
+
+        The NGC W matrices learn across items. After 50+ items, they encode
+        real structure: questions in domain X tend to have answers with
+        embedding pattern Y. This is knowledge the LLM doesn't have —
+        it's cross-item structural knowledge accumulated by the cognitive layer.
         """
         field = self.controller.agent.field
-        prompt_tokens = _alphanum_tokens(prompt, max_tokens=64)
-        prompt_obs = field._fhrr_to_obs(field.encoder.encode_sequence(prompt_tokens))
 
-        # Snapshot the prompt-grounded state to restore between choices.
+        # Get SBERT embeddings directly
+        prompt_obs = field.text_to_obs(prompt)
+
+        # Settle on prompt first to ground the NGC
         try:
+            field.ngc.settle(prompt_obs)
             base_state = field.ngc.save_state()
         except Exception:
             base_state = None
 
         scores = np.zeros(len(choices), dtype=np.float64)
         derived_obs: List[Dict[str, int]] = []
+
         for i, c in enumerate(choices):
             if base_state is not None:
                 try:
                     field.ngc.restore_state(base_state)
                 except Exception:
                     pass
-            ctoks = _alphanum_tokens(c, max_tokens=32)
-            choice_obs = field._fhrr_to_obs(field.encoder.encode_sequence(ctoks))
+
+            # Get SBERT embedding of the choice (or prompt+choice for context)
+            choice_obs = field.text_to_obs(f"{prompt} {c}")
+
             try:
                 field.ngc.settle(choice_obs, steps=self.falsify_settle_steps)
-                pe = float(field.ngc.prediction_error(prompt_obs))
+                # Prediction: what does the NGC think layer 0 should look like
+                # given the abstract state it settled into for this choice?
+                predicted = field.ngc.predict_observation()
+                # Score: how well does this prediction match the prompt embedding?
+                pe = float(np.sum((prompt_obs - predicted) ** 2))
             except Exception as e:
-                logger.error(
-                    "NGC falsification failed for choice %d: %s",
-                    i, e, exc_info=True,
-                )
+                logger.error("NGC falsification failed for choice %d: %s", i, e)
                 pe = float(1e9)
             scores[i] = -pe
 
-            # Derive a compact discrete observation for the energy arena.
-            # Each variable is bucketed into 4 levels to match the per-choice
-            # SCM cardinality. The buckets are deterministic from the field
-            # state, not random.
+            # Derive discrete observations for the energy arena
             try:
-                pred_obs = field.ngc.predict_observation()
-                pf = self._bucket_4(float(np.dot(prompt_obs, prompt_obs) ** 0.5))
-                cm = self._bucket_4(-pe)
-                co = self._bucket_4(float(np.dot(pred_obs, prompt_obs)))
-                ob = self._bucket_4(float(np.linalg.norm(pred_obs)))
+                pf = self._bucket_4(float(np.linalg.norm(prompt_obs)))
+                cm = self._bucket_4(-pe / max(float(np.linalg.norm(prompt_obs)) ** 2, 1.0))
+                co = self._bucket_4(float(
+                    np.dot(predicted, prompt_obs) /
+                    (np.linalg.norm(predicted) * np.linalg.norm(prompt_obs) + 1e-10)
+                ))
+                ob = self._bucket_4(float(np.linalg.norm(predicted)))
                 derived_obs.append({
-                    "prompt_feature": pf,
-                    "choice_match": cm,
-                    "coherence": co,
-                    "observation": ob,
+                    "prompt_feature": pf, "choice_match": cm,
+                    "coherence": co, "observation": ob,
                 })
             except Exception:
                 derived_obs.append({
@@ -483,8 +461,7 @@ class CanonicalPipeline:
                     "coherence": 0, "observation": 0,
                 })
 
-        # Restore the prompt-grounded state so subsequent perceive calls aren't
-        # contaminated by the last falsification settle.
+        # Restore prompt-grounded state
         if base_state is not None:
             try:
                 field.ngc.restore_state(base_state)
@@ -853,11 +830,9 @@ class CanonicalPipeline:
     def _sbert_choice_scores(self, sample: TaskSample) -> np.ndarray:
         """Score choices by SBERT sentence-level cosine similarity.
 
-        This is the strongest semantic signal: it compares the prompt against
-        each choice using frozen sentence embeddings from a pretrained SBERT
-        model. Unlike the NGC falsification path, this signal is NOT destroyed
-        by the random FHRR→obs projection and directly measures semantic
-        relatedness in the original embedding space.
+        Uses field.text_to_obs() which goes directly to SBERT embeddings
+        when available, giving the cognitive layer the same semantic signal
+        it uses for NGC falsification and Hopfield memory.
         """
         n = len(sample.choices)
         scores = np.zeros(n, dtype=np.float64)
@@ -865,83 +840,66 @@ class CanonicalPipeline:
             return scores
 
         field = self.controller.agent.field
-        features = field.encoder.features
-        # Try to get the SBERT model from the semantic codebook
-        getter = getattr(features, "get_sbert_model", None)
-        sbert = getter() if callable(getter) else None
-        if sbert is None:
+        prompt_emb = field.get_sbert_embedding(sample.prompt)
+        if prompt_emb is None:
+            return scores
+
+        pn = float(np.linalg.norm(prompt_emb))
+        if pn < 1e-8:
             return scores
 
         try:
-            texts = [sample.prompt] + [
-                f"{sample.prompt} {c}" for c in sample.choices
-            ]
-            embs = sbert.encode(texts, show_progress_bar=False)
-            pe = embs[0]
-            pn = float(np.linalg.norm(pe))
-            if pn < 1e-8:
-                return scores
-            for i in range(n):
-                ce = embs[i + 1]
-                cn = float(np.linalg.norm(ce))
-                if cn > 1e-8:
-                    scores[i] = float(np.dot(pe, ce) / (pn * cn))
+            for i, c in enumerate(sample.choices):
+                choice_emb = field.get_sbert_embedding(f"{sample.prompt} {c}")
+                if choice_emb is not None:
+                    cn = float(np.linalg.norm(choice_emb))
+                    if cn > 1e-8:
+                        scores[i] = float(np.dot(prompt_emb, choice_emb) / (pn * cn))
         except Exception as e:
             logger.debug("SBERT choice scoring failed: %s", e)
 
         return scores
 
     def _memory_choice_scores(self, sample: TaskSample) -> np.ndarray:
-        """Retrieve prior successful episodes and score choices by similarity.
+        """Score choices by Hopfield memory retrieval in SBERT space.
 
-        This is the persistent memory channel inside the same posterior update
-        as predictive-coding falsification, causal energy, and LLM evidence.
+        The Hopfield bank now stores full SBERT embeddings. We query it with
+        the prompt's SBERT embedding and measure how similar the retrieved
+        memory is to each choice's embedding. This gives real cross-item
+        transfer: "past prompts similar to this one had answers similar to
+        choice X."
         """
         n = len(sample.choices)
         scores = np.zeros(n, dtype=np.float64)
         if n == 0:
             return scores
 
-        episodic = getattr(self.controller.agent, "episodic", None)
-        if episodic is None or not getattr(episodic, "episodes", None):
-            return scores
-
         field = self.controller.agent.field
-        prompt_fhrr = self._encode_text_fhrr(sample.prompt, max_tokens=96)
-        prompt_obs = field._fhrr_to_obs(prompt_fhrr)
-        query_belief = np.full(n, 1.0 / n, dtype=np.float64)
+        if field.memory.n_patterns == 0:
+            return scores
 
+        prompt_emb = field.get_sbert_embedding(sample.prompt)
+        if prompt_emb is None:
+            return scores
+
+        # Retrieve from Hopfield memory using prompt SBERT embedding
         try:
-            query_ctx = episodic.compute_item_representation(prompt_obs, query_belief)
-            retrieved = episodic.retrieve_by_context(query_context=query_ctx, k=8)
+            retrieved, _energy = field.memory.retrieve(prompt_emb)
         except Exception as e:
-            logger.debug("persistent episodic retrieval skipped: %s", e)
+            logger.debug("memory retrieval failed: %s", e)
             return scores
 
-        if not retrieved:
+        ret_norm = np.linalg.norm(retrieved)
+        if ret_norm < 1e-8:
             return scores
 
-        choice_vecs = [
-            self._unit_real(self._encode_text_fhrr(choice, max_tokens=48))
-            for choice in sample.choices
-        ]
-        for ep in retrieved:
-            meta = getattr(ep, "metadata", {}) or {}
-            correct_vec = meta.get("correct_fhrr_real")
-            if correct_vec is None:
-                continue
-            correct_vec = np.asarray(correct_vec, dtype=np.float64)
-            cn = np.linalg.norm(correct_vec)
-            if cn <= 1e-10:
-                continue
-            correct_vec = correct_vec / cn
-            ctx_sim = float(np.dot(query_ctx, ep.context_vector))
-            if ctx_sim <= 0.0:
-                continue
-            confidence = 1.0 - float(ep.surprise)
-            weight = ctx_sim * max(0.05, confidence)
-            for i, choice_vec in enumerate(choice_vecs):
-                scores[i] += weight * float(np.dot(choice_vec, correct_vec))
+        # Score each choice by similarity to retrieved memory
+        for i, c in enumerate(sample.choices):
+            choice_emb = field.get_sbert_embedding(f"{sample.prompt} {c}")
+            if choice_emb is not None:
+                cn = float(np.linalg.norm(choice_emb))
+                if cn > 1e-8:
+                    scores[i] = float(np.dot(retrieved, choice_emb) / (ret_norm * cn))
 
         return scores
 
@@ -977,18 +935,23 @@ class CanonicalPipeline:
                         gold_rank_score = 1.0 / n  # no discrimination
                     self._channel_alpha[name] += gold_rank_score * 0.5
         field = self.controller.agent.field
-        prompt_fhrr = self._encode_text_fhrr(sample.prompt, max_tokens=96)
-        correct_fhrr = self._encode_text_fhrr(
-            f"{sample.prompt} {sample.choices[sample.gold]}",
-            max_tokens=128,
-        )
-        prompt_obs = field._fhrr_to_obs(prompt_fhrr)
-        correct_obs = field._fhrr_to_obs(correct_fhrr)
+
+        # Store the correct answer's SBERT embedding in Hopfield memory.
+        # This is the cross-item learning signal: future prompts will
+        # retrieve this embedding and use it to score choices.
+        correct_text = f"{sample.prompt} {sample.choices[sample.gold]}"
+        correct_emb = field.get_sbert_embedding(correct_text)
+        if correct_emb is not None:
+            field.memory.store(correct_emb)
+
+        # Settle NGC on the correct answer's SBERT embedding and learn.
+        # This teaches the W matrices the structure of correct Q→A mappings.
+        correct_obs = field.text_to_obs(correct_text)
+        prompt_obs = field.text_to_obs(sample.prompt)
 
         try:
             field.ngc.settle(correct_obs, steps=max(1, self.falsify_settle_steps))
             field.ngc.learn(modulation=max(0.0, self.feedback_learning_rate))
-            field.memory.store(field.ngc.get_abstract_state(level=-1))
         except Exception as e:
             logger.debug("feedback NGC learning skipped: %s", e)
 
@@ -1038,19 +1001,6 @@ class CanonicalPipeline:
                     term.scm.update_from_data([self._last_derived_obs[sample.gold]])
                 except Exception as e:
                     logger.debug("feedback SCM update skipped: %s", e)
-
-            # Update the persistent domain SCM with the gold-label observation.
-            # This is what makes the causal arena accumulate experience: the
-            # domain SCM's CPTs evolve with each feedback signal, and future
-            # items in the same domain start with this accumulated knowledge.
-            domain = sample.metadata.get("domain", "general")
-            domain_key = f"domain_{domain}"
-            domain_scm = self._domain_scm_library.get(domain_key)
-            if domain_scm is not None and self._last_derived_obs:
-                try:
-                    domain_scm.update_from_data([self._last_derived_obs[sample.gold]])
-                except Exception as e:
-                    logger.debug("domain SCM update skipped: %s", e)
 
         try:
             self.controller.agent.experience_replay(n_episodes=3)

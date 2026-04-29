@@ -1,28 +1,26 @@
 """
-Unified Energy Landscape: One functional to rule them all.
+Unified Energy Landscape — operating in SBERT embedding space.
 
-Earlier designs used separate components for separate kinds of energy
-minimization. This module unifies them into a single energy
-functional that decomposes into local terms:
+V3: The cognitive stack operates DIRECTLY in the sentence-transformer
+embedding space. No random projection, no FHRR→obs conversion for the
+cognitive path.
 
-    E_total = E_perception + E_memory + E_causal
+    Layer 0 of NGC = SBERT embedding (384-dim for MiniLM-L6-v2)
+    Hopfield memory stores SBERT embeddings
+    Falsification compares SBERT embeddings through learned W matrices
 
-Where:
-    E_perception = Σ_ℓ (1/2Σℓ) ||zℓ - Wℓφ(z^{ℓ+1})||²     (NGC/predictive coding)
-    E_memory     = -lse(β, Xᵀξ) + ½||ξ||²                   (Hopfield energy)
-    E_causal     = Σ_v (1/2) ||z_v - f_v(z_pa(v))||²          (SCM prediction error)
+Why: The NGC needs to learn the structure of how questions map to answers.
+Random projections destroy the semantic structure that SBERT provides.
+With 100+ benchmark items, the NGC sees enough data to learn real
+generative models of question→answer mappings in SBERT space.
 
-All three are: "sum of squared prediction errors on a graph."
-The NGC circuit predicts its input. The Hopfield network predicts its query.
-The causal model predicts effects from causes. Same operation, different scale.
+The FHRR encoder is preserved for compositional binding operations
+(role-filler pairs, sequence encoding) but is NOT in the NGC's
+observation path. FHRR lives alongside SBERT, not in front of it.
 
-The system settles by passing messages on this combined graph until the
-total energy reaches a minimum. That minimum IS the system's best explanation
-of the observation, given its memory and causal beliefs.
-
-This is what Friston's Free Energy Principle actually says: every component
-of the system minimizes its own local VFE, and the global behavior emerges
-from the composition of these local optimizations.
+Energy decomposition remains:
+    E_total = E_perception (NGC) + E_memory (Hopfield)
+Both now operate on semantically meaningful vectors.
 """
 
 import logging
@@ -44,41 +42,38 @@ class EnergyDecomposition:
     memory: float        # Hopfield retrieval energy
     causal: float        # Causal SCM prediction error
     total: float         # Sum
-    prediction_error_norm: float  # ||obs − predicted||² after settling (sensor space)
+    prediction_error_norm: float  # ||obs − predicted||² after settling
     surprise: float      # -log P(observation | beliefs)
 
 
 class HopfieldMemoryBank:
     """
-    Modern Hopfield network operating in FHRR space.
-    
-    Stores FHRR hypervectors as patterns. Retrieval is energy minimization:
+    Modern Hopfield network operating in SBERT embedding space.
+
+    Stores sentence embeddings as patterns. Retrieval is energy minimization:
         E(ξ) = -lse(β, Xᵀξ) + ½||ξ||²
         ξ_new = X · softmax(β · Xᵀ · ξ)
-    
-    This is mathematically identical to a single attention head where:
-        - stored patterns X = keys = values
-        - query ξ = the probe
-        - β = 1/√d_k (inverse temperature)
+
+    Now stores 384-dim SBERT embeddings (not 8-dim NGC top states).
+    This gives the memory enough information to distinguish semantically
+    different inputs and retrieve genuinely relevant past experiences.
     """
-    
-    def __init__(self, dim: int, beta: float = 0.01, capacity: int = 10000):
+
+    def __init__(self, dim: int, beta: float = 0.05, capacity: int = 10000):
         self.dim = dim
         self.beta = beta
         self.capacity = capacity
-        
+
         self.patterns: deque = deque(maxlen=capacity)
         self._matrix: Optional[np.ndarray] = None
         self._dirty = True
 
     def clear(self) -> None:
-        """Remove all stored patterns; invalidate the pattern matrix cache."""
         self.patterns.clear()
         self._matrix = None
         self._dirty = True
 
     def store(self, pattern: np.ndarray, normalize: bool = True):
-        """Store a pattern (FHRR vector — use real part for Hopfield)."""
         p = np.real(pattern).astype(np.float64) if np.iscomplexobj(pattern) else pattern.astype(np.float64)
         if normalize:
             norm = np.linalg.norm(p)
@@ -86,25 +81,21 @@ class HopfieldMemoryBank:
                 p = p / norm
         self.patterns.append(p)
         self._dirty = True
-    
+
     def retrieve(self, query: np.ndarray, steps: int = 3) -> Tuple[np.ndarray, float]:
-        """
-        Retrieve via energy minimization.
-        Returns (retrieved_pattern, energy).
-        """
         if not self.patterns:
             return np.zeros(self.dim), 0.0
-        
+
         self._ensure_matrix()
-        
+
         q = np.real(query).astype(np.float64) if np.iscomplexobj(query) else query.astype(np.float64)
         norm = np.linalg.norm(q)
         if norm > 0:
             q = q / norm
-        
+
         xi = q.copy()
         for _ in range(steps):
-            sims = self._matrix.T @ xi  # (n_patterns,)
+            sims = self._matrix.T @ xi
             scaled = self.beta * sims
             scaled -= scaled.max()
             weights = np.exp(scaled)
@@ -116,28 +107,21 @@ class HopfieldMemoryBank:
             if np.allclose(xi, xi_new, atol=1e-8):
                 break
             xi = xi_new
-        
-        # Energy
+
         sims = self._matrix.T @ xi
         if self.beta <= 1e-12:
-            _logger.warning(
-                "HopfieldMemoryBank.retrieve: self.beta=%g is near zero; "
-                "energy uses approximate uniform-attention form "
-                "(0.5||xi||² - mean(sims)) instead of -lse/beta)",
-                float(self.beta),
-            )
             energy = float(0.5 * np.dot(xi, xi) - np.mean(sims))
         else:
             log_sum_exp = np.log(np.sum(np.exp(self.beta * sims - self.beta * sims.max()))) + self.beta * sims.max()
             energy = float(-log_sum_exp / self.beta + 0.5 * np.dot(xi, xi))
-        
+
         return xi, energy
-    
+
     def _ensure_matrix(self):
         if self._dirty and self.patterns:
             self._matrix = np.column_stack(list(self.patterns))
             self._dirty = False
-    
+
     @property
     def n_patterns(self):
         return len(self.patterns)
@@ -145,95 +129,150 @@ class HopfieldMemoryBank:
 
 class UnifiedField:
     """
-    The unified cognitive field.
-    
-    Composes:
-      1. FHRR encoder (observation → compositional hypervector)
-      2. NGC circuit (hierarchical predictive coding)
-      3. Hopfield memory (content-addressed retrieval)
-    
-    All connected through a single energy functional.
-    One step of cognition:
-      a. Encode observation as FHRR vector
-      b. Settle NGC circuit (minimize perception energy)
-      c. Query Hopfield memory with settled top-layer state (minimize memory energy)
-      d. Use memory retrieval to refine predictions (close the loop)
-      e. Learn: Hebbian update on NGC weights + store in Hopfield
-    
-    The total energy E_total = E_ngc + E_hopfield monotonically decreases.
+    The unified cognitive field — operating in SBERT embedding space.
+
+    V3 architecture:
+      1. SBERT encoder provides the observation vector (no projection needed)
+      2. NGC circuit operates on SBERT embeddings: layer 0 = sbert_dim
+      3. Hopfield memory stores SBERT embeddings directly
+      4. FHRR encoder preserved for compositional binding (parallel path)
+
+    The NGC learns a generative model of how text maps to embeddings.
+    After 100+ items, the W matrices encode real structure: "prompts in
+    this domain tend to predict answers with these embedding patterns."
+    This makes falsification genuine: "does settling on this answer's
+    embedding produce a good prediction of the prompt's embedding?"
     """
-    
+
+    # Default SBERT dim for all-MiniLM-L6-v2
+    DEFAULT_SBERT_DIM = 384
+
     def __init__(self,
                  obs_dim: int = 256,
                  hidden_dims: List[int] = None,
                  fhrr_dim: int = 2048,
-                 hopfield_beta: float = 0.01,
+                 hopfield_beta: float = 0.05,
                  ngc_settle_steps: int = 20,
                  ngc_learning_rate: float = 0.005,
                  ngc_precisions: Optional[List[float]] = None,
-                 energy_history_maxlen: int = 500):
+                 energy_history_maxlen: int = 500,
+                 sbert_dim: Optional[int] = None):
         """
         Args:
-            obs_dim: Dimension of the observation layer (FHRR → real projection)
-            hidden_dims: NGC hidden layer dimensions [h1, h2, ...]. 
-                        Full hierarchy = [obs_dim] + hidden_dims
-            fhrr_dim: FHRR hypervector dimensionality
+            obs_dim: Legacy parameter. If sbert_dim is set, NGC uses sbert_dim
+                     for layer 0 instead. Kept for backward compatibility with
+                     code that constructs UnifiedField with obs_dim.
+            hidden_dims: NGC hidden layer dimensions. Full hierarchy =
+                        [sbert_dim or obs_dim] + hidden_dims
+            fhrr_dim: FHRR dimensionality (for compositional binding path)
             hopfield_beta: Inverse temperature for Hopfield retrieval
             ngc_settle_steps: Settling iterations for NGC
             ngc_learning_rate: Hebbian learning rate
-            energy_history_maxlen: Max UnifiedField energy decomposition records retained
+            sbert_dim: If set, NGC layer 0 uses this dimension (SBERT space).
+                      Detected automatically when SBERT is available.
         """
         if hidden_dims is None:
             hidden_dims = [128, 32]
-        
-        self.obs_dim = obs_dim
+
         self.fhrr_dim = fhrr_dim
-        
-        # FHRR encoder
+
+        # FHRR encoder (for compositional binding — parallel path)
         self.encoder = FHRREncoder(dim=fhrr_dim)
-        
-        # Structure-preserving projection: FHRR (complex, fhrr_dim) → real (obs_dim)
-        # Instead of a random matrix that destroys semantic structure, we use
-        # a fixed projection derived from the FHRR basis itself. The real part
-        # of the FHRR vector is sliced/averaged into obs_dim buckets. This
-        # preserves the phasor structure: similar FHRR vectors → similar obs.
-        #
-        # For obs_dim < fhrr_dim: average adjacent blocks of size fhrr_dim/obs_dim.
-        # For obs_dim >= fhrr_dim: pad with zeros (rare in practice).
-        self._proj_mode = "structured"
-        if obs_dim <= fhrr_dim:
-            # Structured averaging: each obs dimension = mean of a block of FHRR dims
-            self._proj_block_size = fhrr_dim // obs_dim
-            self._proj_remainder = fhrr_dim % obs_dim
+
+        # Detect SBERT dimension from the encoder
+        self._sbert_dim = sbert_dim
+        if self._sbert_dim is None:
+            # Try to detect from the semantic codebook
+            features = self.encoder.features
+            if hasattr(features, '_sbert_dim') and features._sbert_dim is not None:
+                self._sbert_dim = features._sbert_dim
+            elif hasattr(features, '_ensure_sbert'):
+                features._ensure_sbert()
+                if hasattr(features, '_sbert_dim') and features._sbert_dim is not None:
+                    self._sbert_dim = features._sbert_dim
+
+        # NGC operates in SBERT space when available, else falls back to obs_dim
+        if self._sbert_dim is not None and self._sbert_dim > 0:
+            self.obs_dim = self._sbert_dim
+            _logger.info(
+                "UnifiedField: NGC operating in SBERT space (dim=%d)", self._sbert_dim
+            )
         else:
-            self._proj_block_size = 1
-            self._proj_remainder = 0
-        
-        # NGC circuit: hierarchical predictive coding
-        layer_sizes = [obs_dim] + hidden_dims
+            self.obs_dim = obs_dim
+            _logger.info(
+                "UnifiedField: SBERT unavailable, NGC using obs_dim=%d", obs_dim
+            )
+
+        # NGC circuit: layer 0 = SBERT dim (or obs_dim fallback)
+        layer_sizes = [self.obs_dim] + hidden_dims
         self.ngc = PredictiveCodingCircuit(
             layer_sizes=layer_sizes,
             precisions=ngc_precisions,
             settle_steps=ngc_settle_steps,
             learning_rate=ngc_learning_rate,
         )
-        
-        # Hopfield memory: stores abstract states from NGC top layer
-        top_dim = hidden_dims[-1]
-        self.memory = HopfieldMemoryBank(dim=top_dim, beta=hopfield_beta)
-        
+
+        # Hopfield memory: stores SBERT embeddings directly
+        # NOT the tiny NGC top-layer states — full SBERT embeddings so
+        # retrieval can distinguish semantically different inputs.
+        self.memory = HopfieldMemoryBank(
+            dim=self.obs_dim, beta=hopfield_beta
+        )
+
+        # Legacy: keep _fhrr_to_obs working for callers that still use it
+        self._proj_mode = "identity_or_sbert"
+        self._proj_block_size = max(1, fhrr_dim // self.obs_dim)
+
         # Energy tracking
         self._step_count = 0
-        self.energy_history: Deque[EnergyDecomposition] = deque(maxlen=max(1, int(energy_history_maxlen)))
-    
-    def _fhrr_to_obs(self, fhrr_vec: np.ndarray) -> np.ndarray:
-        """Project FHRR complex vector to real observation space.
-        
-        Uses structure-preserving block averaging instead of random projection.
-        Each obs dimension = mean of a contiguous block of FHRR real components.
-        This preserves semantic similarity: if two FHRR vectors have similar
-        phasor angles, their block averages will also be similar.
+        self.energy_history: Deque[EnergyDecomposition] = deque(
+            maxlen=max(1, int(energy_history_maxlen))
+        )
+
+    def get_sbert_embedding(self, text: str) -> Optional[np.ndarray]:
+        """Encode text directly to SBERT embedding, bypassing FHRR.
+
+        Returns None if SBERT is not available.
         """
+        features = self.encoder.features
+        getter = getattr(features, "get_sbert_model", None)
+        sbert = getter() if callable(getter) else None
+        if sbert is None:
+            return None
+        try:
+            emb = sbert.encode([text], show_progress_bar=False)[0]
+            return np.asarray(emb, dtype=np.float64)
+        except Exception as e:
+            _logger.debug("SBERT encoding failed: %s", e)
+            return None
+
+    def text_to_obs(self, text: str) -> np.ndarray:
+        """Convert text to observation vector for NGC.
+
+        Prefers SBERT embedding (semantically rich, right dimensionality).
+        Falls back to FHRR→block-average if SBERT is unavailable.
+        """
+        emb = self.get_sbert_embedding(text)
+        if emb is not None:
+            # Ensure correct dimension
+            if len(emb) == self.obs_dim:
+                return emb
+            elif len(emb) > self.obs_dim:
+                return emb[:self.obs_dim]
+            else:
+                return np.pad(emb, (0, self.obs_dim - len(emb)))
+
+        # Fallback: FHRR path
+        import re
+        tokens = re.findall(
+            r"[a-zA-Z]+(?:'[a-z]+)?|[0-9]+(?:\.[0-9]+)?", text.lower()
+        )[-64:]
+        fhrr_vec = self.encoder.encode_sequence(tokens) if tokens else \
+            np.ones(self.fhrr_dim, dtype=np.complex64)
+        return self._fhrr_to_obs(fhrr_vec)
+
+    def _fhrr_to_obs(self, fhrr_vec: np.ndarray) -> np.ndarray:
+        """Legacy: project FHRR to obs space via block averaging."""
         real_part = np.real(fhrr_vec).astype(np.float64)
         bs = self._proj_block_size
         obs = np.zeros(self.obs_dim, dtype=np.float64)
@@ -243,123 +282,104 @@ class UnifiedField:
             if start < len(real_part):
                 obs[i] = np.mean(real_part[start:end])
         return obs
-    
+
     def observe(self, raw_input: Any, input_type: str = "numeric") -> Dict[str, Any]:
         """
-        Full cognitive cycle: observe → predict → error → settle → learn → remember.
-        
-        Args:
-            raw_input: The observation. Type depends on input_type:
-                "numeric": np.ndarray of floats
-                "bindings": dict of {role: filler} string pairs
-                "tokens": list of string tokens
-                "text": a single string (split into tokens)
-            input_type: How to interpret raw_input
-        
-        Returns:
-            Full cycle diagnostics
+        Full cognitive cycle in SBERT space.
+
+        For text inputs: encodes via SBERT directly (no FHRR intermediary).
+        For legacy inputs (numeric, bindings, tokens): uses FHRR→obs fallback.
         """
         self._step_count += 1
-        
-        # === 1. ENCODE: raw input → FHRR → observation vector ===
-        if input_type == "numeric":
-            fhrr_vec = self.encoder.encode_numeric_vector(np.asarray(raw_input))
+
+        # === 1. ENCODE ===
+        if input_type == "text":
+            obs_vec = self.text_to_obs(str(raw_input))
+            fhrr_vec = self.encoder.encode_sequence(
+                str(raw_input).lower().split()
+            )
+        elif input_type == "tokens":
+            # Try SBERT on joined text, fall back to FHRR
+            text = " ".join(raw_input) if isinstance(raw_input, list) else str(raw_input)
+            obs_vec = self.text_to_obs(text)
+            fhrr_vec = self.encoder.encode_sequence(raw_input)
         elif input_type == "bindings":
             fhrr_vec = self.encoder.encode_observation(raw_input)
-        elif input_type == "tokens":
-            fhrr_vec = self.encoder.encode_sequence(raw_input)
-        elif input_type == "text":
-            tokens = str(raw_input).lower().split()
-            fhrr_vec = self.encoder.encode_sequence(tokens)
+            # Try to get SBERT embedding from the binding values
+            text = " ".join(f"{k} {v}" for k, v in raw_input.items())
+            obs_vec = self.text_to_obs(text)
+        elif input_type == "numeric":
+            fhrr_vec = self.encoder.encode_numeric_vector(np.asarray(raw_input))
+            obs_vec = self._fhrr_to_obs(fhrr_vec)
         else:
             raise ValueError(f"Unknown input_type: {input_type}")
-        
-        obs_vec = self._fhrr_to_obs(fhrr_vec)
-        
-        # === 2. PREDICT: what did the NGC expect before this observation's settle cycle? ===
+
+        # === 2. PREDICT ===
         prediction_error_pre_settle = self.ngc.prediction_error(obs_vec)
-        
-        # === 3. SETTLE: minimize perception energy ===
+
+        # === 3. SETTLE ===
         settle_result = self.ngc.settle(obs_vec)
         perception_energy = settle_result["final_energy"]
-        
-        # === 4. JOINT SETTLING: Hopfield retrieval feeds back into NGC ===
-        # This closes the loop that was previously sequential:
-        #   settle NGC → query Hopfield → DONE (old: pipeline)
-        # Now: settle NGC → query Hopfield → inject memory → re-settle NGC
-        # The second settle integrates memory evidence, making the energy
-        # decomposition genuinely joint rather than a sequential pipeline.
+
+        # === 4. MEMORY: query and re-settle ===
         abstract_state = self.ngc.get_abstract_state(level=-1)
-        retrieved, memory_energy = self.memory.retrieve(abstract_state)
-        
-        # Compute memory consistency
-        abstract_norm = np.linalg.norm(abstract_state)
-        retrieved_norm = np.linalg.norm(retrieved)
-        if abstract_norm > 1e-8 and retrieved_norm > 1e-8:
-            memory_similarity = float(np.dot(abstract_state, retrieved) / 
-                                     (abstract_norm * retrieved_norm))
+
+        # Store the SBERT embedding in Hopfield (not the tiny abstract state)
+        # but query with the abstract state projected back to obs_dim
+        # Actually: store obs_vec (SBERT embedding) and query with obs_vec
+        # The memory operates in the same space as NGC layer 0.
+        retrieved, memory_energy = self.memory.retrieve(obs_vec)
+
+        obs_norm = np.linalg.norm(obs_vec)
+        ret_norm = np.linalg.norm(retrieved)
+        if obs_norm > 1e-8 and ret_norm > 1e-8:
+            memory_similarity = float(
+                np.dot(obs_vec / obs_norm, retrieved / ret_norm)
+            )
         else:
             memory_similarity = 0.0
-        
-        # Memory-guided re-settle: blend retrieved memory into top NGC layer
-        # and re-settle to integrate memory evidence into the full hierarchy.
-        # The blend weight is derived from memory_similarity itself:
-        # high similarity → strong blend (memory confirms), low → weak blend.
-        if self.memory.n_patterns > 2 and retrieved_norm > 1e-8:
-            # Blend weight = sigmoid(memory_similarity * 3) clamped to [0, 0.5]
-            # This means memory can provide up to 50% of the top-layer state,
-            # but only when it strongly matches the current abstract state.
+
+        # Memory-guided re-settle
+        if self.memory.n_patterns > 2 and ret_norm > 1e-8:
             blend = float(1.0 / (1.0 + np.exp(-3.0 * memory_similarity)))
             blend = min(blend, 0.5)
-            
-            # Inject retrieved memory into the top NGC layer
             top_layer = self.ngc.layers[-1]
-            top_layer.z = (1.0 - blend) * top_layer.z + blend * retrieved
-            
-            # Re-settle with memory evidence integrated
-            # Use fewer steps since we're refining, not starting from scratch
-            re_settle = self.ngc.settle(obs_vec, steps=max(3, self.ngc.settle_steps // 3))
+            # Project retrieved memory (obs_dim) to top-layer dim
+            # Use the NGC's own prediction to do this: retrieve → settle layer 0
+            # → the top layer state IS the "memory's view" of the abstract state
+            # Simpler: just blend at layer 0 and re-settle
+            self.ngc.layers[0].z = (1.0 - blend) * obs_vec + blend * retrieved
+            re_settle = self.ngc.settle(
+                self.ngc.layers[0].z,
+                steps=max(3, self.ngc.settle_steps // 3)
+            )
             perception_energy = re_settle["final_energy"]
-            
-            # Re-query Hopfield with the refined abstract state
             abstract_state = self.ngc.get_abstract_state(level=-1)
-            retrieved, memory_energy = self.memory.retrieve(abstract_state)
-        
+
         prediction_error_post_settle = self.ngc.prediction_error(obs_vec)
-        
-        # === 5. LEARN: Precision-modulated Hebbian update ===
-        # Learning modulation: high when observation is consistent with memory,
-        # low when it contradicts stored patterns.
-        # This prevents the NGC from learning equally from truth and lies.
-        #
-        # modulation = sigmoid(memory_similarity * temperature)
-        # When mem_sim is high (consistent): modulation → 1.0 (learn fully)
-        # When mem_sim is low/negative (contradictory): modulation → 0.0 (don't learn)
-        # When no memory yet (step 1-2): modulation = 1.0 (learn from everything initially)
+
+        # === 5. LEARN ===
         if self.memory.n_patterns <= 2:
-            # Not enough memory to judge consistency — learn from everything
             learning_modulation = 1.0
         else:
-            # Sigmoid: maps [-1, 1] similarity to [0, 1] modulation
-            # temperature=3.0 makes the transition fairly sharp
-            learning_modulation = float(1.0 / (1.0 + np.exp(-3.0 * memory_similarity)))
-        
+            learning_modulation = float(
+                1.0 / (1.0 + np.exp(-3.0 * memory_similarity))
+            )
+
         self.ngc.learn(modulation=learning_modulation)
-        self.memory.store(abstract_state)
-        
-        # === 6. ENERGY: compute decomposition ===
+        self.memory.store(obs_vec)  # Store SBERT embedding, not abstract state
+
+        # === 6. ENERGY ===
         decomp = EnergyDecomposition(
             perception=perception_energy,
             memory=memory_energy,
-            causal=0.0,  # Will be added when causal module is connected
+            causal=0.0,
             total=perception_energy + memory_energy,
             prediction_error_norm=float(prediction_error_post_settle),
-            # Monotone prediction-error proxy.  ``log1p`` keeps surprise
-            # non-negative even when the squared prediction error is below 1.0.
             surprise=float(np.log1p(max(prediction_error_post_settle, 0.0))),
         )
         self.energy_history.append(decomp)
-        
+
         return {
             "step": self._step_count,
             "fhrr_vector": fhrr_vec,
@@ -374,21 +394,16 @@ class UnifiedField:
             "prediction_error_pre_settle": prediction_error_pre_settle,
             "prediction_error_post_settle": prediction_error_post_settle,
         }
-    
+
     def predict(self) -> np.ndarray:
-        """
-        What does the system expect to observe next?
-        
-        This is the forward prediction from the settled internal state.
-        """
         return self.ngc.predict_observation()
-    
+
     @property
     def total_energy(self) -> float:
         if self.energy_history:
             return self.energy_history[-1].total
         return 0.0
-    
+
     @property
     def statistics(self) -> Dict[str, Any]:
         return {
@@ -398,7 +413,5 @@ class UnifiedField:
             "memory_patterns": self.memory.n_patterns,
             "fhrr_dim": self.fhrr_dim,
             "obs_dim": self.obs_dim,
+            "sbert_dim": self._sbert_dim,
         }
-
-
-
