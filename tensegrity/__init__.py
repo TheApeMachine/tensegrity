@@ -1,34 +1,27 @@
 """
-Tensegrity: a non-gradient cognitive architecture centered on a unified
-energy landscape.
+Tensegrity: a non-gradient cognitive architecture operating in SBERT
+embedding space.
 
-The primary engine is now the V2 ``UnifiedField`` stack:
+V3 architecture:
+    SBERT embedding → NGC predictive coding → Hopfield memory
+    → causal energy terms → Bayesian belief integration
 
-    FHRR encoding -> hierarchical predictive coding -> Hopfield memory
-    -> optional causal energy terms
-
-Legacy V1 components (`TensegrityAgent`, `MortonEncoder`, `MarkovBlanket`) remain
-importable from ``tensegrity.legacy.v1``. Several other names are re-exported lazily
-via ``tensegrity`` for migration only: ``EpistemicMemory``, ``EpisodicMemory``, and
-``AssociativeMemory`` from ``tensegrity.memory.*``; ``CausalArena`` and
-``StructuralCausalModel`` from ``tensegrity.causal.*``; ``FreeEnergyEngine`` and
-``BeliefPropagator`` from ``tensegrity.inference.*``. Those are **not** defined under
-``tensegrity.legacy.v1``—use the module paths above when importing explicitly.
-
-Top-level exports intentionally expose the unified field as the default
-architecture. Deprecated V1 names are resolved lazily for migration only.
+Primary exports:
+    CognitiveAgent  — the complete agent (replaces V1 TensegrityAgent)
+    UnifiedField    — SBERT-native NGC + Hopfield
+    CanonicalPipeline — benchmark/chat entry point
 """
 
-from importlib import import_module
-from typing import Any
-import warnings
-
-from tensegrity.engine import (
+from tensegrity.engine.unified_field import (
     UnifiedField,
     HopfieldMemoryBank,
     EnergyDecomposition,
+)
+from tensegrity.engine.ngc import (
     PredictiveCodingCircuit,
     LayerState,
+)
+from tensegrity.engine.fhrr import (
     FHRREncoder,
     FHRRCodebook,
     SemanticFHRRCodebook,
@@ -36,24 +29,39 @@ from tensegrity.engine import (
     bundle,
     unbind,
     permute,
+)
+from tensegrity.engine.causal_energy import (
     EnergyCausalArena,
     CausalEnergyTerm,
     TopologyMapper,
     TopologyMapping,
     VirtualParent,
-    ScoringBridge,
-    NGCLogitsProcessor,
 )
+from tensegrity.engine.agent import (
+    CognitiveAgent,
+    DEFAULT_MEDIATED_SCM_NAME,
+)
+from tensegrity.causal.scm import StructuralCausalModel
+from tensegrity.causal.arena import CausalArena
+from tensegrity.inference.free_energy import FreeEnergyEngine
+from tensegrity.inference.belief_propagation import BeliefPropagator
+from tensegrity.memory.episodic import EpisodicMemory
+from tensegrity.memory.epistemic import EpistemicMemory
 
-__version__ = "0.1.0"
+__version__ = "0.3.0"
 
 __all__ = (
     "__version__",
+    # Agent
+    "CognitiveAgent",
+    "DEFAULT_MEDIATED_SCM_NAME",
+    # Engine
     "UnifiedField",
     "HopfieldMemoryBank",
     "EnergyDecomposition",
     "PredictiveCodingCircuit",
     "LayerState",
+    # FHRR
     "FHRREncoder",
     "FHRRCodebook",
     "SemanticFHRRCodebook",
@@ -61,47 +69,18 @@ __all__ = (
     "bundle",
     "unbind",
     "permute",
+    # Causal
     "EnergyCausalArena",
     "CausalEnergyTerm",
     "TopologyMapper",
     "TopologyMapping",
     "VirtualParent",
-    "ScoringBridge",
-    "NGCLogitsProcessor",
+    "StructuralCausalModel",
+    "CausalArena",
+    # Inference
+    "FreeEnergyEngine",
+    "BeliefPropagator",
+    # Memory
+    "EpisodicMemory",
+    "EpistemicMemory",
 )
-
-_LEGACY_EXPORTS = {
-    "TensegrityAgent": ("tensegrity.legacy.v1.agent", "TensegrityAgent"),
-    "MortonEncoder": ("tensegrity.legacy.v1.morton", "MortonEncoder"),
-    "MarkovBlanket": ("tensegrity.legacy.v1.blanket", "MarkovBlanket"),
-    "EpistemicMemory": ("tensegrity.memory.epistemic", "EpistemicMemory"),
-    "EpisodicMemory": ("tensegrity.memory.episodic", "EpisodicMemory"),
-    "AssociativeMemory": ("tensegrity.memory.associative", "AssociativeMemory"),
-    "CausalArena": ("tensegrity.causal.arena", "CausalArena"),
-    "StructuralCausalModel": ("tensegrity.causal.scm", "StructuralCausalModel"),
-    "FreeEnergyEngine": ("tensegrity.inference.free_energy", "FreeEnergyEngine"),
-    "BeliefPropagator": ("tensegrity.inference.belief_propagation", "BeliefPropagator"),
-}
-
-
-def __getattr__(name: str) -> Any:
-    """Resolve deprecated top-level V1 names with an explicit migration warning."""
-    target = _LEGACY_EXPORTS.get(name)
-
-    if target is None:
-        raise AttributeError(f"module 'tensegrity' has no attribute {name!r}")
-
-    module_name, attr = target
-    
-    warnings.warn(
-        f"tensegrity.{name} is not part of the primary V2 export surface. "
-        f"Import {name} from {module_name} explicitly, or use "
-        "tensegrity.UnifiedField for the unified energy engine.",
-        DeprecationWarning,
-        stacklevel=2,
-    )
-    
-    value = getattr(import_module(module_name), attr)
-    globals()[name] = value
-    
-    return value

@@ -22,7 +22,7 @@ import logging
 import re
 from difflib import SequenceMatcher
 
-from tensegrity.legacy.v1.agent import TensegrityAgent, DEFAULT_MEDIATED_SCM_NAME
+from tensegrity.engine.agent import CognitiveAgent, DEFAULT_MEDIATED_SCM_NAME
 from tensegrity.broca.schemas import (
     ParsedObservation,
     ParsedFeedback,
@@ -92,7 +92,7 @@ class CognitiveController:
     
     def __init__(
         self,
-        agent: Optional[TensegrityAgent] = None,
+        agent: Optional[CognitiveAgent] = None,
         broca: Optional[BrocaInterface] = None,
         n_hypotheses: int = 8,
         hypothesis_labels: Optional[List[str]] = None,
@@ -102,7 +102,7 @@ class CognitiveController:
     ):
         """
         Args:
-            agent: TensegrityAgent instance. Created with defaults if None.
+            agent: CognitiveAgent instance. Created with defaults if None.
             broca: BrocaInterface instance. Created with defaults if None.
             n_hypotheses: Number of competing hypotheses to maintain
             hypothesis_labels: Labels for the hypothesis space
@@ -127,11 +127,11 @@ class CognitiveController:
         n_obs = n_states * 4  # Observation space > hypothesis space
         n_actions = 4  # ask, state, eliminate, conclude
         
-        self.agent = agent or TensegrityAgent(
+        self.agent = agent or CognitiveAgent(
             n_states=n_states,
             n_observations=n_obs,
             n_actions=n_actions,
-            sensory_dims=n_states,  # Morton dims = hypothesis dims
+            sensory_dims=n_states,
             sensory_bits=4,
             context_dim=32,
             associative_dim=64,
@@ -189,7 +189,7 @@ class CognitiveController:
         while len(labels) < n_hyp:
             labels.append(f"_empty_{len(labels)}")
         
-        self.agent = TensegrityAgent(
+        self.agent = CognitiveAgent(
             n_states=n_hyp,
             n_observations=n_hyp * 4,
             n_actions=4,
@@ -394,27 +394,6 @@ class CognitiveController:
         """
         n = len(self.belief_state.hypotheses) or self.agent.n_states
         features = np.zeros(n)
-        
-        # Detect binary yes/no tasks. For these tasks, the template parser's
-        # keyword-based polarity detection is systematically wrong because
-        # passages about questions almost always contain negation words
-        # ("not", "doesn't") that have nothing to do with the answer.
-        # When we detect a binary yes/no task, we suppress the template
-        # parser's relation-based evidence entirely and let SBERT carry
-        # the signal. This fixes the BoolQ -12% regression.
-        active_labels = [
-            h.description.lower() for h in self.belief_state.hypotheses
-            if not h.description.startswith("_empty_")
-        ]
-        is_binary_yesno = (
-            len(active_labels) == 2
-            and any(l in ("yes", "no", "true", "false") for l in active_labels)
-        )
-        if is_binary_yesno:
-            # For binary yes/no: return zero vector (no template-parser evidence).
-            # SBERT sentence similarity in the canonical pipeline will provide
-            # the actual signal. The template parser does more harm than good here.
-            return features
         
         # Map entities and relations to hypothesis dimensions using the
         # known hypothesis labels. The LLM parser (or template fallback)

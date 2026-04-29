@@ -1,6 +1,6 @@
 """
-Unified cognitive engine: compositional encoding, predictive coding, unified field,
-semantic scoring, and optional energy-based causal competition.
+Unified cognitive engine: SBERT-native predictive coding, Hopfield memory,
+FHRR compositional encoding, and energy-based causal competition.
 """
 
 from tensegrity.engine.unified_field import UnifiedField, HopfieldMemoryBank, EnergyDecomposition
@@ -21,7 +21,7 @@ from tensegrity.engine.causal_energy import (
     TopologyMapping,
     VirtualParent,
 )
-from tensegrity.engine.scoring import ScoringBridge, NGCLogitsProcessor
+from tensegrity.engine.agent import CognitiveAgent, DEFAULT_MEDIATED_SCM_NAME
 
 __all__ = (
     "UnifiedField",
@@ -41,6 +41,6 @@ __all__ = (
     "TopologyMapper",
     "TopologyMapping",
     "VirtualParent",
-    "ScoringBridge",
-    "NGCLogitsProcessor",
+    "CognitiveAgent",
+    "DEFAULT_MEDIATED_SCM_NAME",
 )
