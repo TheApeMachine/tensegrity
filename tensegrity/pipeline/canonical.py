@@ -130,14 +130,15 @@ class CanonicalPipeline:
         model_name: str = "meta-llama/Llama-3.2-1B-Instruct",
         # Loop budget
         max_iterations: int = 4,
-        # Convergence: top1/top2 ratio above which we commit. Default 2.0
-        # means the leader must be at least twice the runner-up in mass.
+        # Convergence is now self-tuning: derived from belief entropy dynamics.
+        # commit_ratio is kept as an initial value but will be overridden.
         commit_ratio: float = 2.0,
         # Falsification: how many NGC steps to settle each choice for the
         # top-down-predict-the-prompt operation.
         falsify_settle_steps: int = 20,
-        # Bayesian update strength when integrating falsification likelihood
-        # into the controller's hypothesis posteriors.
+        # These weights are now INITIAL values for the Dirichlet channel
+        # reliability tracker. They will be dynamically updated based on each
+        # channel's prediction accuracy. The system auto-tunes them.
         falsify_update_strength: float = 1.0,
         # Energy-arena precision (passed through to CausalEnergyTerm).
         energy_arena_precision: float = 1.0,
@@ -151,8 +152,6 @@ class CanonicalPipeline:
         # Persistent episodic recall enters as a memory-evidence channel.
         memory_evidence_weight: float = 0.75,
         # SBERT sentence similarity enters as a semantic-evidence channel.
-        # This is the strongest signal source: it compares the prompt against
-        # each (prompt+choice) concatenation using frozen sentence embeddings.
         sbert_evidence_weight: float = 0.8,
         feedback_learning_rate: float = 1.0,
         persistent_state_path: Optional[str] = None,
@@ -163,11 +162,32 @@ class CanonicalPipeline:
         self.falsify_settle_steps = int(falsify_settle_steps)
         self.falsify_update_strength = float(falsify_update_strength)
         self.max_hypotheses = max(2, int(max_hypotheses))
+        self.feedback_learning_rate = float(feedback_learning_rate)
+        self.persistent_state_path = persistent_state_path
+
+        # --- Dirichlet channel reliability tracking ---
+        # Instead of fixed weights, each evidence channel has a Dirichlet
+        # pseudo-count that grows when the channel's top-ranked choice matches
+        # the committed belief (cross-channel agreement) or the gold label
+        # (post-feedback). Fusion weights = normalized counts.
+        #
+        # This is the VFE-minimizing closed form from pymdp:
+        #   α* = α₀ + Σ_t obs_t ⊗ qs_t
+        # where α₀ is the initial prior strength.
+        #
+        # Channels: falsify, llm, memory, sbert, energy_arena
+        self._channel_names = ["falsify", "llm", "memory", "sbert", "energy"]
+        self._channel_alpha = {
+            "falsify": float(falsify_update_strength),
+            "llm": float(llm_evidence_weight),
+            "memory": float(memory_evidence_weight),
+            "sbert": float(sbert_evidence_weight),
+            "energy": float(energy_arena_beta),
+        }
+        # Expose derived weights (computed from alpha each call)
         self.llm_evidence_weight = float(llm_evidence_weight)
         self.memory_evidence_weight = float(memory_evidence_weight)
         self.sbert_evidence_weight = float(sbert_evidence_weight)
-        self.feedback_learning_rate = float(feedback_learning_rate)
-        self.persistent_state_path = persistent_state_path
 
         initial_labels = list(hypothesis_labels or [])
         while len(initial_labels) < self.max_hypotheses:
@@ -539,6 +559,78 @@ class CanonicalPipeline:
             return top > 0
         return top >= ratio * second
 
+    def _channel_weights(self) -> Dict[str, float]:
+        """Compute normalized fusion weights from Dirichlet pseudo-counts.
+        
+        weights_m = alpha_m / sum(alpha)
+        
+        This is the expected value of the Dirichlet posterior over channel
+        reliabilities. As channels accumulate evidence of correctness,
+        their weight grows; unreliable channels fade toward zero.
+        """
+        total = sum(self._channel_alpha.values())
+        if total <= 0:
+            n = len(self._channel_names)
+            return {c: 1.0 / n for c in self._channel_names}
+        return {c: self._channel_alpha[c] / total for c in self._channel_names}
+
+    def _update_channel_reliability(
+        self, channel_scores: Dict[str, np.ndarray], committed_idx: int, n: int
+    ) -> None:
+        """Update Dirichlet pseudo-counts via cross-channel agreement.
+        
+        Each channel earns pseudo-counts when its top-ranked choice agrees
+        with other channels. This is the consensus-based reliability update
+        from the IterativeCognitiveScorer, elevated to the canonical pipeline.
+        
+        After feedback (gold label revealed), the channel that ranked the
+        gold answer highest gets a bonus pseudo-count — this is the
+        VFE-minimizing Dirichlet update from pymdp.
+        """
+        if n < 2:
+            return
+        
+        # Get each channel's top pick
+        picks = {}
+        for name, scores in channel_scores.items():
+            if scores is not None and len(scores) >= n:
+                s = scores[:n]
+                if np.any(np.abs(s) > 1e-12):
+                    picks[name] = int(np.argmax(s))
+        
+        if len(picks) < 2:
+            return
+        
+        # Cross-channel agreement: each channel gets credit for agreeing
+        # with others. This is NOT self-fulfilling — the anchor is the
+        # consensus structure, not any single channel.
+        for name_i, pick_i in picks.items():
+            agreements = sum(1 for name_j, pick_j in picks.items()
+                           if name_j != name_i and pick_j == pick_i)
+            if agreements > 0:
+                credit = float(agreements) / max(len(picks) - 1, 1)
+                self._channel_alpha[name_i] += credit * 0.1  # slow accumulation
+
+    def _adaptive_commit_ratio(self, belief: np.ndarray) -> float:
+        """Derive the convergence commit ratio from belief entropy dynamics.
+        
+        Instead of a fixed commit_ratio=2.0, the threshold adapts:
+        - When entropy is high (uniform beliefs), require higher separation (more cautious)
+        - When entropy is low (concentrated beliefs), require less separation (confident)
+        
+        commit_ratio = 1.5 + entropy * 1.5
+        At max entropy (1.0): ratio = 3.0 (very cautious)
+        At min entropy (0.0): ratio = 1.5 (quick commit)
+        """
+        n = len(belief)
+        if n < 2:
+            return self.commit_ratio
+        nz = belief[belief > 0]
+        if len(nz) < 2:
+            return 1.5
+        entropy = float(-np.sum(nz * np.log(nz)) / np.log(n))
+        return 1.5 + entropy * 1.5
+
     # ---------- main entry: score one item ----------
 
     def score_multichoice(
@@ -602,21 +694,32 @@ class CanonicalPipeline:
             )
 
             # 3. Bayesian update of controller's hypothesis posteriors:
-            #    new_p_i ∝ old_p_i * exp(strength * z(falsify_i)) * energy_post_i.
+            #    new_p_i ∝ old_p_i * exp(w_c * z(channel_c_i)) for each channel c.
+            #    Channel weights w_c are derived from Dirichlet pseudo-counts,
+            #    not hardcoded — they auto-tune based on reliability.
             old_belief = self._belief_from_controller(n)
             fz = self._znorm(falsify)
             lz = self._znorm(linguistic)
             mz = self._znorm(memory_scores)
             sz = self._znorm(sbert_scores)
-            log_lik_falsify = self.falsify_update_strength * fz
+            
+            w = self._channel_weights()
             log_post = (
                 np.log(np.maximum(old_belief, 1e-12))
-                + log_lik_falsify
-                + self.llm_evidence_weight * lz
-                + self.memory_evidence_weight * mz
-                + self.sbert_evidence_weight * sz
-                + np.log(np.maximum(energy_post, 1e-12))
+                + w["falsify"] * fz
+                + w["llm"] * lz
+                + w["memory"] * mz
+                + w["sbert"] * sz
+                + w["energy"] * np.log(np.maximum(energy_post, 1e-12))
             )
+            
+            # Track per-channel scores for reliability update
+            _channel_scores = {
+                "falsify": falsify, "llm": linguistic,
+                "memory": memory_scores, "sbert": sbert_scores,
+                "energy": energy_post,
+            }
+            self._last_channel_scores_iter = _channel_scores
             log_post -= log_post.max()
             new_belief = np.exp(log_post)
             sb = new_belief.sum()
@@ -657,13 +760,21 @@ class CanonicalPipeline:
                 top_p=top_p,
             ))
 
-            if self._converged(new_belief, self.commit_ratio):
+            # Update channel reliability via cross-channel agreement
+            self._update_channel_reliability(_channel_scores, top_idx, n)
+
+            # Adaptive convergence: commit ratio derived from belief entropy
+            adaptive_ratio = self._adaptive_commit_ratio(new_belief)
+            if self._converged(new_belief, adaptive_ratio):
                 converged = True
                 break
 
         # Final commit using the controller's belief state (the source of truth).
         final_belief = self._belief_from_controller(n)
         committed_idx = int(np.argmax(final_belief))
+
+        # Save last channel scores for gold-label Dirichlet update in learn_from_feedback
+        self._last_channel_scores = getattr(self, '_last_channel_scores_iter', {})
 
         # Calibrated score for the harness: belief shifted away from uniform,
         # bounded in [-1, 1]. Comparable in magnitude to the previous z-scored
@@ -813,6 +924,24 @@ class CanonicalPipeline:
             return {"learned": False, "reason": "invalid sample"}
 
         correct = int(committed_idx) == int(sample.gold)
+        # --- Dirichlet channel reliability update from gold label ---
+        # This is the VFE-minimizing update: channels that ranked the gold
+        # answer higher get more pseudo-counts. This is the ONLY place where
+        # external supervision enters the channel weighting system.
+        # The update is: α_m += correctness_score_m (how well channel m
+        # ranked the gold answer relative to its ranking of other choices).
+        if hasattr(self, '_last_channel_scores') and self._last_channel_scores:
+            for name, scores in self._last_channel_scores.items():
+                if scores is not None and len(scores) >= n and sample.gold < n:
+                    s = scores[:n]
+                    s_range = float(np.max(s) - np.min(s))
+                    if s_range > 1e-12:
+                        # How well did this channel rank the gold answer?
+                        # Normalized to [0, 1]: 1 = gold was ranked highest
+                        gold_rank_score = float((s[sample.gold] - np.min(s)) / s_range)
+                    else:
+                        gold_rank_score = 1.0 / n  # no discrimination
+                    self._channel_alpha[name] += gold_rank_score * 0.5
         field = self.controller.agent.field
         prompt_fhrr = self._encode_text_fhrr(sample.prompt, max_tokens=96)
         correct_fhrr = self._encode_text_fhrr(

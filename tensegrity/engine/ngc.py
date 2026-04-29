@@ -93,7 +93,12 @@ class PredictiveCodingCircuit:
                  precision_momentum: float = 0.9,
                  precision_min: float = 0.1,
                  precision_max: float = 100.0,
-                 max_history_length: int = 2000):
+                 max_history_length: int = 2000,
+                 # --- Self-tuning settle parameters ---
+                 adaptive_settle: bool = True,
+                 settle_convergence_threshold: float = 0.01,
+                 settle_min_steps: int = 5,
+                 settle_max_steps: int = 100):
         """
         Args:
             layer_sizes: [dim_sensory, dim_hidden1, ..., dim_top]
@@ -102,15 +107,28 @@ class PredictiveCodingCircuit:
                        If None, defaults to 1.0 everywhere. Length must equal ``n_layers`` when given.
             tau: Membrane time constant (settling speed)
             gamma: State decay rate (leaky integration)
-            settle_steps: How many steps to run before declaring convergence
+            settle_steps: Default settling steps (used as fallback if adaptive_settle=False)
             settle_steps_warm: Steps when the observation is nearly unchanged (warm-started z)
-            obs_change_threshold: L2 change above this triggers full settle_steps
+            obs_change_threshold: L2 change above this triggers full settle
             learning_rate: Hebbian learning rate for synaptic updates
             activation: Nonlinearity: "tanh", "relu", "sigmoid", or "linear"
-            adaptive_precision: If True, update precisions from prediction-error variance in learn()
+            adaptive_precision: If True, update precisions from prediction-error variance
+                via Friston's log-precision gradient (Millidge et al. 2021, Eq 20-22):
+                    dΣ/dt = ε̃·ε̃ᵀ − Σ⁻¹
+                At fixed point, Σ_l = Var[ε̃] → precision = 1/Var[ε̃].
+                Implemented as EMA: Σ_l ← (1-α)·Σ_l + α·mean(ε²)
             precision_momentum: EMA factor for precision updates (higher = slower change)
             precision_min / precision_max: Clamp learned precisions
             max_history_length: Max entries retained in energy / error history (ring buffer)
+            adaptive_settle: If True, settle until energy convergence instead of fixed steps.
+                The system monitors ||E_t - E_{t-1}|| and stops when the energy
+                change drops below settle_convergence_threshold, bounded by
+                [settle_min_steps, settle_max_steps]. This replaces the fixed
+                settle_steps parameter with a self-tuning criterion derived from
+                the system's own dynamics.
+            settle_convergence_threshold: Energy change threshold for early stopping
+            settle_min_steps: Minimum settling steps (even if converged)
+            settle_max_steps: Maximum settling steps (hard ceiling)
         """
         self.n_layers = len(layer_sizes)
         self.layer_sizes = layer_sizes
@@ -126,19 +144,29 @@ class PredictiveCodingCircuit:
         self.precision_max = precision_max
         self.max_history_length = max(1, int(max_history_length))
         self.activation = activation
+        self.adaptive_settle = adaptive_settle
+        self.settle_convergence_threshold = settle_convergence_threshold
+        self.settle_min_steps = max(1, int(settle_min_steps))
+        self.settle_max_steps = max(self.settle_min_steps, int(settle_max_steps))
         
         # Activation function
         self._phi, self._phi_deriv = self._get_activation(activation)
         
-        # Precisions (per layer): ρ = 1/σ²
+        # --- Friston log-precision state (per-layer) ---
+        # γ_l = log(precision_l). Updated via gradient descent on VFE:
+        #   F_γ = 0.5·(mean(ε̃²) − 1)  (Millidge Eq 21)
+        # At fixed point: precision = 1/Var[ε] = exp(γ)
+        # Initialized to log(1.0) = 0.0 (unit precision = maximum uncertainty)
         if precisions is None:
             self.precisions = [1.0] * self.n_layers
+            self._log_precisions = [0.0] * self.n_layers
         else:
             if len(precisions) != self.n_layers:
                 raise ValueError(
                     f"precisions must have length n_layers={self.n_layers}, got {len(precisions)}"
                 )
             self.precisions = list(precisions)
+            self._log_precisions = [float(np.log(max(p, 1e-8))) for p in precisions]
         
         # Generative weights W[ℓ]: maps layer ℓ+1 → prediction of layer ℓ
         # W[ℓ] has shape (layer_sizes[ℓ], layer_sizes[ℓ+1])
@@ -281,6 +309,9 @@ class PredictiveCodingCircuit:
         
         if steps is not None:
             n_steps = steps
+        elif self.adaptive_settle:
+            # Adaptive: we'll settle until convergence, bounded by min/max
+            n_steps = self.settle_max_steps
         elif not self._initialized:
             n_steps = self.settle_steps
         elif obs_changed:
@@ -336,6 +367,13 @@ class PredictiveCodingCircuit:
             
             energy_trace.append(total_energy)
             error_norms.append(step_error_norms)
+            
+            # --- Adaptive settle: early exit when energy converges ---
+            if self.adaptive_settle and steps is None and step >= self.settle_min_steps - 1:
+                if len(energy_trace) >= 2:
+                    delta_e = abs(energy_trace[-1] - energy_trace[-2])
+                    if delta_e < self.settle_convergence_threshold:
+                        break
         
         self.energy_history.append(energy_trace[-1])
         self.error_history.append(error_norms[-1])
@@ -351,18 +389,23 @@ class PredictiveCodingCircuit:
     
     def learn(self, modulation: float = 1.0):
         """
-        Hebbian synaptic update after settling.
+        Hebbian synaptic update after settling, with Friston precision update.
         
         ΔWℓ = modulation * lr * (e^{ℓ-1} · (φ(z^ℓ))ᵀ)
         
-        The modulation parameter gates learning: when the current observation
-        is inconsistent with established beliefs (high prediction error +
-        low memory similarity), modulation should be low, preventing the
-        system from learning from contradictory evidence.
+        Precision update (Millidge et al. 2021, Eq 20-22):
+            dΣ/dt = ε̃·ε̃ᵀ − Σ⁻¹
+            At fixed point: Σ_l = Var[ε̃] → precision = 1/Var[ε̃]
         
-        This is precision-weighted Hebbian learning: the effective learning
-        rate is lr * modulation, where modulation encodes the system's
-        confidence that this observation is trustworthy.
+        Implemented in log-space for numerical stability:
+            γ_l = log(precision_l)
+            F_γ = 0.5 · (mean(ε̃²) − 1)    (gradient of VFE w.r.t. log-precision)
+            γ_l ← γ_l − lr_precision · F_γ
+        
+        The learning rate for Hebbian weights is precision-scaled:
+            η_eff = lr · modulation · precision_l
+        This is the natural gradient preconditioning from Friston's theory:
+        more precise layers learn faster because their errors are more trustworthy.
         """
         effective_lr = self.lr * modulation
         
@@ -370,25 +413,41 @@ class PredictiveCodingCircuit:
             for ell in range(self.n_layers):
                 residual = self.layers[ell].z - self.layers[ell].z_bar
                 sq_error = float(np.mean(residual ** 2))
-                target_precision = 1.0 / max(sq_error, 1e-6)
-                mom = self.precision_momentum
-                self.precisions[ell] = mom * self.precisions[ell] + (1.0 - mom) * target_precision
-                self.precisions[ell] = float(
-                    np.clip(self.precisions[ell], self.precision_min, self.precision_max)
+                
+                # Friston log-precision gradient: F_γ = 0.5·(precision·mean(ε²) − 1)
+                # At fixed point: precision·Var[ε] = 1 → precision = 1/Var[ε]
+                current_prec = self.precisions[ell]
+                f_gamma = 0.5 * (current_prec * sq_error - 1.0)
+                
+                # Update log-precision via gradient descent
+                # lr_precision = 0.1 · (1-momentum) to match EMA time constant
+                lr_precision = 0.1 * (1.0 - self.precision_momentum)
+                self._log_precisions[ell] -= lr_precision * f_gamma
+                
+                # Clamp and exponentiate
+                log_min = np.log(max(self.precision_min, 1e-8))
+                log_max = np.log(self.precision_max)
+                self._log_precisions[ell] = float(
+                    np.clip(self._log_precisions[ell], log_min, log_max)
                 )
+                self.precisions[ell] = float(np.exp(self._log_precisions[ell]))
                 self.layers[ell].precision = self.precisions[ell]
         
         for ell in range(self.n_layers - 1):
             error_below = self.layers[ell].error
             z_above = self._phi(self.layers[ell + 1].z)
             
+            # Precision-scaled learning rate: more precise layers learn faster.
+            # This IS the natural gradient from Friston's theory.
+            layer_lr = effective_lr * min(self.precisions[ell], 10.0)
+            
             # Generative weight update: Hebbian + decay
             dW = np.outer(error_below, z_above)
-            self.W[ell] += effective_lr * dW - effective_lr * self.gamma * self.W[ell]
+            self.W[ell] += layer_lr * dW - layer_lr * self.gamma * self.W[ell]
             
             # Feedback weight update
             dE = np.outer(self.layers[ell + 1].z, error_below)
-            self.E[ell] += effective_lr * dE - effective_lr * self.gamma * self.E[ell]
+            self.E[ell] += layer_lr * dE - layer_lr * self.gamma * self.E[ell]
             
             # Spectral normalization (power iteration — cheaper than full SVD)
             w_norm = _spectral_norm_power_iteration(self.W[ell])
@@ -441,6 +500,7 @@ class PredictiveCodingCircuit:
             "W": [w.copy() for w in self.W],
             "E": [e.copy() for e in self.E],
             "precisions": list(self.precisions),
+            "_log_precisions": list(self._log_precisions),
             "_initialized": self._initialized,
             "_last_obs": None if self._last_obs is None else self._last_obs.copy(),
         }
@@ -448,6 +508,8 @@ class PredictiveCodingCircuit:
     def restore_state(self, state: Dict[str, Any]) -> None:
         """Restore from ``save_state()``."""
         self.precisions = list(state["precisions"])
+        self._log_precisions = list(state.get("_log_precisions",
+            [float(np.log(max(p, 1e-8))) for p in self.precisions]))
         self.W = [w.copy() for w in state["W"]]
         self.E = [e.copy() for e in state["E"]]
         self._initialized = bool(state["_initialized"])

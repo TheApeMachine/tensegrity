@@ -192,10 +192,22 @@ class UnifiedField:
         # FHRR encoder
         self.encoder = FHRREncoder(dim=fhrr_dim)
         
-        # Random projection: FHRR (complex, fhrr_dim) → real (obs_dim)
-        # Fixed, not learned — this is the sensory transduction
-        rng = np.random.RandomState(42)
-        self._proj = rng.randn(obs_dim, fhrr_dim).astype(np.float64) / np.sqrt(fhrr_dim)
+        # Structure-preserving projection: FHRR (complex, fhrr_dim) → real (obs_dim)
+        # Instead of a random matrix that destroys semantic structure, we use
+        # a fixed projection derived from the FHRR basis itself. The real part
+        # of the FHRR vector is sliced/averaged into obs_dim buckets. This
+        # preserves the phasor structure: similar FHRR vectors → similar obs.
+        #
+        # For obs_dim < fhrr_dim: average adjacent blocks of size fhrr_dim/obs_dim.
+        # For obs_dim >= fhrr_dim: pad with zeros (rare in practice).
+        self._proj_mode = "structured"
+        if obs_dim <= fhrr_dim:
+            # Structured averaging: each obs dimension = mean of a block of FHRR dims
+            self._proj_block_size = fhrr_dim // obs_dim
+            self._proj_remainder = fhrr_dim % obs_dim
+        else:
+            self._proj_block_size = 1
+            self._proj_remainder = 0
         
         # NGC circuit: hierarchical predictive coding
         layer_sizes = [obs_dim] + hidden_dims
@@ -215,9 +227,22 @@ class UnifiedField:
         self.energy_history: Deque[EnergyDecomposition] = deque(maxlen=max(1, int(energy_history_maxlen)))
     
     def _fhrr_to_obs(self, fhrr_vec: np.ndarray) -> np.ndarray:
-        """Project FHRR complex vector to real observation space."""
+        """Project FHRR complex vector to real observation space.
+        
+        Uses structure-preserving block averaging instead of random projection.
+        Each obs dimension = mean of a contiguous block of FHRR real components.
+        This preserves semantic similarity: if two FHRR vectors have similar
+        phasor angles, their block averages will also be similar.
+        """
         real_part = np.real(fhrr_vec).astype(np.float64)
-        return self._proj @ real_part
+        bs = self._proj_block_size
+        obs = np.zeros(self.obs_dim, dtype=np.float64)
+        for i in range(self.obs_dim):
+            start = i * bs
+            end = min(start + bs, len(real_part))
+            if start < len(real_part):
+                obs[i] = np.mean(real_part[start:end])
+        return obs
     
     def observe(self, raw_input: Any, input_type: str = "numeric") -> Dict[str, Any]:
         """
@@ -258,13 +283,16 @@ class UnifiedField:
         settle_result = self.ngc.settle(obs_vec)
         perception_energy = settle_result["final_energy"]
         
-        prediction_error_post_settle = self.ngc.prediction_error(obs_vec)
-        
-        # === 4. REMEMBER: query Hopfield with abstract state ===
+        # === 4. JOINT SETTLING: Hopfield retrieval feeds back into NGC ===
+        # This closes the loop that was previously sequential:
+        #   settle NGC → query Hopfield → DONE (old: pipeline)
+        # Now: settle NGC → query Hopfield → inject memory → re-settle NGC
+        # The second settle integrates memory evidence, making the energy
+        # decomposition genuinely joint rather than a sequential pipeline.
         abstract_state = self.ngc.get_abstract_state(level=-1)
         retrieved, memory_energy = self.memory.retrieve(abstract_state)
         
-        # Compute memory consistency: how similar is this observation to stored patterns?
+        # Compute memory consistency
         abstract_norm = np.linalg.norm(abstract_state)
         retrieved_norm = np.linalg.norm(retrieved)
         if abstract_norm > 1e-8 and retrieved_norm > 1e-8:
@@ -272,6 +300,32 @@ class UnifiedField:
                                      (abstract_norm * retrieved_norm))
         else:
             memory_similarity = 0.0
+        
+        # Memory-guided re-settle: blend retrieved memory into top NGC layer
+        # and re-settle to integrate memory evidence into the full hierarchy.
+        # The blend weight is derived from memory_similarity itself:
+        # high similarity → strong blend (memory confirms), low → weak blend.
+        if self.memory.n_patterns > 2 and retrieved_norm > 1e-8:
+            # Blend weight = sigmoid(memory_similarity * 3) clamped to [0, 0.5]
+            # This means memory can provide up to 50% of the top-layer state,
+            # but only when it strongly matches the current abstract state.
+            blend = float(1.0 / (1.0 + np.exp(-3.0 * memory_similarity)))
+            blend = min(blend, 0.5)
+            
+            # Inject retrieved memory into the top NGC layer
+            top_layer = self.ngc.layers[-1]
+            top_layer.z = (1.0 - blend) * top_layer.z + blend * retrieved
+            
+            # Re-settle with memory evidence integrated
+            # Use fewer steps since we're refining, not starting from scratch
+            re_settle = self.ngc.settle(obs_vec, steps=max(3, self.ngc.settle_steps // 3))
+            perception_energy = re_settle["final_energy"]
+            
+            # Re-query Hopfield with the refined abstract state
+            abstract_state = self.ngc.get_abstract_state(level=-1)
+            retrieved, memory_energy = self.memory.retrieve(abstract_state)
+        
+        prediction_error_post_settle = self.ngc.prediction_error(obs_vec)
         
         # === 5. LEARN: Precision-modulated Hebbian update ===
         # Learning modulation: high when observation is consistent with memory,
