@@ -226,6 +226,16 @@ class CanonicalPipeline:
         self._choice_model_names: List[str] = []
         self._last_derived_obs: List[Dict[str, int]] = []
 
+        # --- Persistent causal knowledge ---
+        # Domain-level SCMs persist across items within a task. Instead of
+        # rebuilding every SCM from scratch per item (which gives uniform CPTs
+        # that contribute noise), we maintain a library of domain SCMs keyed
+        # by task domain. When a new item arrives, we look up existing SCMs
+        # for that domain and re-register them with accumulated experience.
+        # Per-choice ephemeral SCMs are still created, but the domain SCM
+        # provides a prior that shapes the per-choice energy competition.
+        self._domain_scm_library: Dict[str, StructuralCausalModel] = {}
+
         if self.persistent_state_path:
             self.load_state(self.persistent_state_path)
 
@@ -286,14 +296,15 @@ class CanonicalPipeline:
         self._scm_topologies = {}
         self._choice_model_names = []
         self._last_derived_obs = []
+
+        # Determine domain for persistent SCM lookup
+        domain = sample.metadata.get("domain", "general")
+
         for i, label in enumerate(labels[:len(sample.choices)]):
-            scm = self._build_choice_scm(i, label)
+            scm = self._build_choice_scm(i, label, domain=domain)
             try:
                 self.energy_arena.register(scm)
                 self._choice_model_names.append(scm.name)
-                # Project this SCM's DAG into the NGC layer hierarchy via
-                # TopologyMapper. Horizontal causal edges are resolved through
-                # virtual parents at higher levels (the "elevator shaft" fix).
                 n_ngc_layers = len(self.controller.agent.field.ngc.layer_sizes)
                 topology = self._topology_mapper.from_scm(scm, n_layers=n_ngc_layers)
                 self._scm_topologies[scm.name] = topology
@@ -345,23 +356,46 @@ class CanonicalPipeline:
 
     # ---------- per-choice SCM (used by EnergyCausalArena) ----------
 
-    def _build_choice_scm(self, choice_idx: int, label: str) -> StructuralCausalModel:
+    def _build_choice_scm(self, choice_idx: int, label: str,
+                          domain: str = "general") -> StructuralCausalModel:
         """
-        Build a tiny SCM for one choice:
+        Build a per-choice SCM, seeded with persistent domain knowledge.
 
+        The structure is always:
             prompt_feature  ──▶  choice_match  ──▶  observation
                                                 ▲
                                                 │ (lateral) coherence
 
-        The DAG has both vertical and horizontal edges. The TopologyMapper
-        is exactly what turns the lateral coherence link into a virtual parent
-        in the NGC hierarchy, addressing the topological-mismatch critique.
+        But CPTs are initialized from the domain SCM library if a matching
+        domain model exists. This means the per-choice SCMs start with
+        accumulated experience from prior items in the same domain, not
+        uniform Dirichlet priors. The domain model is the persistent
+        causal knowledge that survives across items.
         """
         scm = StructuralCausalModel(name=f"choice_{choice_idx}_{label}")
         scm.add_variable("prompt_feature", n_values=4, parents=[])
         scm.add_variable("coherence", n_values=4, parents=[])
         scm.add_variable("choice_match", n_values=4, parents=["prompt_feature"])
         scm.add_variable("observation", n_values=4, parents=["choice_match", "coherence"])
+
+        # Seed from domain library if available
+        domain_key = f"domain_{domain}"
+        if domain_key in self._domain_scm_library:
+            domain_scm = self._domain_scm_library[domain_key]
+            # Copy accumulated CPTs from the domain model
+            for var_name, mech in scm.mechanisms.items():
+                domain_mech = domain_scm.mechanisms.get(var_name)
+                if domain_mech is not None and mech.cpt.shape == domain_mech.cpt.shape:
+                    mech.cpt[:] = domain_mech.cpt
+        else:
+            # Create a new domain SCM for future seeding
+            domain_scm = StructuralCausalModel(name=domain_key)
+            domain_scm.add_variable("prompt_feature", n_values=4, parents=[])
+            domain_scm.add_variable("coherence", n_values=4, parents=[])
+            domain_scm.add_variable("choice_match", n_values=4, parents=["prompt_feature"])
+            domain_scm.add_variable("observation", n_values=4, parents=["choice_match", "coherence"])
+            self._domain_scm_library[domain_key] = domain_scm
+
         return scm
 
     # ---------- one-shot ingest (delegates to controller) ----------
@@ -1004,6 +1038,19 @@ class CanonicalPipeline:
                     term.scm.update_from_data([self._last_derived_obs[sample.gold]])
                 except Exception as e:
                     logger.debug("feedback SCM update skipped: %s", e)
+
+            # Update the persistent domain SCM with the gold-label observation.
+            # This is what makes the causal arena accumulate experience: the
+            # domain SCM's CPTs evolve with each feedback signal, and future
+            # items in the same domain start with this accumulated knowledge.
+            domain = sample.metadata.get("domain", "general")
+            domain_key = f"domain_{domain}"
+            domain_scm = self._domain_scm_library.get(domain_key)
+            if domain_scm is not None and self._last_derived_obs:
+                try:
+                    domain_scm.update_from_data([self._last_derived_obs[sample.gold]])
+                except Exception as e:
+                    logger.debug("domain SCM update skipped: %s", e)
 
         try:
             self.controller.agent.experience_replay(n_episodes=3)

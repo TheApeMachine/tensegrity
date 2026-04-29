@@ -395,6 +395,27 @@ class CognitiveController:
         n = len(self.belief_state.hypotheses) or self.agent.n_states
         features = np.zeros(n)
         
+        # Detect binary yes/no tasks. For these tasks, the template parser's
+        # keyword-based polarity detection is systematically wrong because
+        # passages about questions almost always contain negation words
+        # ("not", "doesn't") that have nothing to do with the answer.
+        # When we detect a binary yes/no task, we suppress the template
+        # parser's relation-based evidence entirely and let SBERT carry
+        # the signal. This fixes the BoolQ -12% regression.
+        active_labels = [
+            h.description.lower() for h in self.belief_state.hypotheses
+            if not h.description.startswith("_empty_")
+        ]
+        is_binary_yesno = (
+            len(active_labels) == 2
+            and any(l in ("yes", "no", "true", "false") for l in active_labels)
+        )
+        if is_binary_yesno:
+            # For binary yes/no: return zero vector (no template-parser evidence).
+            # SBERT sentence similarity in the canonical pipeline will provide
+            # the actual signal. The template parser does more harm than good here.
+            return features
+        
         # Map entities and relations to hypothesis dimensions using the
         # known hypothesis labels. The LLM parser (or template fallback)
         # extracts entities that may match hypothesis names.
