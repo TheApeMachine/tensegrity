@@ -265,11 +265,45 @@ def bind(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     """Bind: element-wise complex multiplication."""
     return a * b
 
-def bundle(*vectors: np.ndarray) -> np.ndarray:
-    """Bundle: element-wise addition + normalize to unit circle."""
+def bundle(*vectors: np.ndarray, top_k: Optional[int] = None) -> np.ndarray:
+    """Bundle: element-wise addition + normalize to unit circle.
+    
+    When top_k is set, applies sparse block coding before bundling:
+    only the top_k dimensions with largest magnitude are preserved in
+    each input vector before addition. This prevents the superposition
+    catastrophe identified in the review: dense SBERT-grounded phasors
+    wash out into noise when too many are bundled, because phase wrapping
+    destroys high-frequency semantic details.
+    
+    The sparsification ensures that only the most salient semantic features
+    contribute to the bundle, keeping the result discriminative even after
+    combining many vectors.
+    
+    Args:
+        *vectors: Complex phasor vectors to bundle
+        top_k: If set, keep only top_k dimensions per vector before bundling.
+               Recommended: dim // 4 for sequences > 20 tokens.
+    """
     if not vectors:
         return np.array([], dtype=np.complex64)
-    stacked = np.stack([np.asarray(v, dtype=np.complex128) for v in vectors], axis=0)
+    
+    if top_k is not None and top_k > 0:
+        # Sparse block coding: zero out all but top_k dimensions per vector
+        sparse_vectors = []
+        for v in vectors:
+            v = np.asarray(v, dtype=np.complex128)
+            magnitudes = np.abs(v)
+            if top_k < len(v):
+                threshold = np.partition(magnitudes, -top_k)[-top_k]
+                mask = magnitudes >= threshold
+                sparse_v = np.where(mask, v, 0.0)
+            else:
+                sparse_v = v
+            sparse_vectors.append(sparse_v)
+        stacked = np.stack(sparse_vectors, axis=0)
+    else:
+        stacked = np.stack([np.asarray(v, dtype=np.complex128) for v in vectors], axis=0)
+    
     result = np.sum(stacked, axis=0).astype(np.complex128)
     magnitude = np.maximum(np.abs(result), 1e-8)
     return (result / magnitude).astype(np.complex64)
@@ -374,9 +408,42 @@ class FHRREncoder:
         bound_pairs = [self.encode_binding(r, f) for r, f in bindings.items()]
         return bundle(*bound_pairs) if bound_pairs else np.ones(self.dim, dtype=np.complex64)
     
-    def encode_sequence(self, tokens: List[str]) -> np.ndarray:
+    def encode_sequence(self, tokens: List[str],
+                        window_size: int = 16) -> np.ndarray:
+        """Encode a token sequence with hierarchical temporal bundling.
+        
+        For short sequences (≤ window_size), bundles all tokens directly.
+        For long sequences, uses a sliding window approach: tokens are
+        bundled within local windows first, then windows are bundled together.
+        This preserves high-resolution semantic detail within each window
+        while summarizing distant context, preventing the phase cancellation
+        that occurs when bundling too many dense SBERT-grounded phasors.
+        
+        Args:
+            tokens: List of string tokens
+            window_size: Tokens per local window (default 16)
+        """
+        if not tokens:
+            return np.ones(self.dim, dtype=np.complex64)
+        
         elements = [permute(self.features.get(t), shift=i) for i, t in enumerate(tokens)]
-        return bundle(*elements) if elements else np.ones(self.dim, dtype=np.complex64)
+        
+        if len(elements) <= window_size:
+            # Short sequence: direct bundle (no phase cancellation risk)
+            return bundle(*elements)
+        
+        # Hierarchical temporal bundling: bundle within windows, then
+        # bundle the window summaries. Uses sparse top_k for the
+        # inter-window bundle to preserve discriminative features.
+        window_summaries = []
+        for start in range(0, len(elements), window_size):
+            window = elements[start:start + window_size]
+            summary = bundle(*window)
+            window_summaries.append(summary)
+        
+        # Bundle window summaries with sparsification to prevent wash-out
+        sparse_k = max(self.dim // 4, 64)
+        return bundle(*window_summaries, top_k=sparse_k)
     
     def encode_numeric_vector(self, values: np.ndarray) -> np.ndarray:
         bound = [bind(self.encode_position(i), self.encode_value(float(v))) for i, v in enumerate(values)]

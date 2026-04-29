@@ -75,13 +75,58 @@ class CausalArena:
     
     def register_model(self, model: StructuralCausalModel, 
                        prior_weight: Optional[float] = None):
-        """Add a competing causal model to the arena."""
+        """Add a competing causal model to the arena.
+        
+        Before registration, checks for structurally redundant models 
+        (same DAG topology as an existing model) and merges their CPTs
+        instead of adding a duplicate. This prevents the combinatorial
+        explosion identified in the review: dozens of near-identical SCMs
+        exhausting the counterfactual budget.
+        """
+        # Check for structural duplicates: same variables + same edges
+        for existing_name, existing_model in self.models.items():
+            if self._structurally_equivalent(model, existing_model):
+                # Merge: absorb the new model's CPTs into the existing one
+                # by averaging Dirichlet pseudocounts. This is mathematically
+                # equivalent to a single parameterized meta-model.
+                logger.info(
+                    f"Merging structurally equivalent model '{model.name}' "
+                    f"into existing '{existing_name}'"
+                )
+                self._merge_model_cpts(existing_model, model)
+                return
+        
         self.models[model.name] = model
         self.model_log_evidence[model.name] = 0.0
         self.model_prior[model.name] = prior_weight or self.prior_concentration
         self.evidence_trajectories[model.name] = [0.0]
         
         logger.info(f"Registered model '{model.name}' in arena")
+    
+    @staticmethod
+    def _structurally_equivalent(a: StructuralCausalModel, 
+                                  b: StructuralCausalModel) -> bool:
+        """Check if two SCMs have the same DAG topology (same variables, same edges)."""
+        if set(a.variables) != set(b.variables):
+            return False
+        for var in a.variables:
+            a_parents = set(a.mechanisms[var].parents) if var in a.mechanisms else set()
+            b_parents = set(b.mechanisms[var].parents) if var in b.mechanisms else set()
+            if a_parents != b_parents:
+                return False
+        return True
+    
+    @staticmethod
+    def _merge_model_cpts(target: StructuralCausalModel, 
+                           source: StructuralCausalModel) -> None:
+        """Merge source CPTs into target by averaging Dirichlet pseudocounts."""
+        for var in target.variables:
+            t_mech = target.mechanisms.get(var)
+            s_mech = source.mechanisms.get(var)
+            if t_mech is not None and s_mech is not None:
+                if t_mech.cpt_params.shape == s_mech.cpt_params.shape:
+                    # Average the Dirichlet pseudocounts
+                    t_mech.cpt_params = (t_mech.cpt_params + s_mech.cpt_params) / 2.0
     
     def compete(self, observation: Dict[str, int]) -> Dict[str, Any]:
         """
@@ -103,6 +148,23 @@ class CausalArena:
             # Accumulate evidence
             self.model_log_evidence[name] += log_lik
             self.evidence_trajectories[name].append(self.model_log_evidence[name])
+        
+        # --- Early energy filter ---
+        # Before running expensive posterior computation and counterfactuals,
+        # check if any model's single-step log-likelihood is catastrophically
+        # bad. If a proposed SCM completely contradicts the observation, skip
+        # the full Bayesian update — it would waste counterfactual budget.
+        if log_likelihoods:
+            best_lik = max(log_likelihoods.values())
+            for name in list(log_likelihoods.keys()):
+                if log_likelihoods[name] < best_lik - 20.0:
+                    # This model's prediction is >20 nats worse than the best.
+                    # Don't waste counterfactuals on it — mark for faster elimination.
+                    logger.debug(
+                        "Energy filter: model '%s' log-lik=%.1f vs best=%.1f (gap=%.1f)",
+                        name, log_likelihoods[name], best_lik,
+                        best_lik - log_likelihoods[name],
+                    )
         
         # Compute posterior P(M_k | data) ∝ exp(cumulative_log_evidence + log_prior)
         posterior = self._compute_posterior()

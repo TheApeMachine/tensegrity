@@ -261,9 +261,19 @@ class TensegrityLogitsProcessor:
                 token_scores = self.hypothesis_token_scores.get(hyp_id, {})
                 
                 if prob <= self.suppress_threshold:
+                    # Dynamic temperature scaling instead of hard -inf.
+                    # The review correctly identified that hard suppression
+                    # to -inf collides with the LLM's syntactic expectations,
+                    # causing broken grammar when suppressed tokens are
+                    # structurally necessary (pronouns, conjunctions, etc.).
+                    #
+                    # Instead: apply a strong but finite negative bias that
+                    # makes the token very unlikely but not impossible. The
+                    # LLM can still use it if syntactic context demands it.
+                    suppress_bias = -self.max_bias  # e.g., -8.0 instead of -inf
                     for tid in token_ids:
                         if 0 <= tid < self.vocab_size:
-                            bias[tid] = -np.inf
+                            bias[tid] = suppress_bias
                             suppressed += 1
                 else:
                     b = self.scale * math.log(max(float(prob), 1e-12) / p_uniform)
@@ -377,7 +387,7 @@ class StaticLogitBiasBuilder:
             
             if prob <= self.suppress_threshold:
                 for tid in token_ids:
-                    bias[tid] = -100.0  # OpenAI convention for hard suppress
+                    bias[tid] = -self.max_bias  # Finite suppress, not -100
             else:
                 b = self.scale * math.log(max(prob, 1e-9) / p_uniform)
                 b = max(-self.max_bias, min(self.max_bias, b))
